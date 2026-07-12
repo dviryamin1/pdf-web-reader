@@ -1,0 +1,26 @@
+[project]
+name = "hebrew-pdf-reader"
+version = "0.1.0"
+description = "Convert text-layer Hebrew PDFs into mobile-friendly standalone HTML readers."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pdfplumber>=0.11",
+  "pypdf>=5",
+]
+
+[project.scripts]
+hebrew-pdf-reader = "pdf_reader_tool:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["pdf_reader_tool"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

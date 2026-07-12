@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Generated readers and local conversion artifacts
+generated-readers/
+outputs/
+work/
+
+# Local runtime logs
+*.log
+*.pid
+*.jobid
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

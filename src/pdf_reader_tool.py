@@ -160,6 +160,26 @@ def filter_words_by_crop(words: list[dict], bounds: tuple[float, float, float, f
     ]
 
 
+def normalize_words_to_layout_bounds(words: list[dict], bounds: tuple[float, float, float, float] | None) -> list[dict]:
+    if bounds is None:
+        return words
+    left, _, _, _ = bounds
+    normalized: list[dict] = []
+    for word in words:
+        item = dict(word)
+        item["x0"] = float(item.get("x0") or 0.0) - left
+        item["x1"] = float(item.get("x1") or 0.0) - left
+        normalized.append(item)
+    return normalized
+
+
+def layout_width_for_bounds(page_width: float, bounds: tuple[float, float, float, float] | None) -> float:
+    if bounds is None:
+        return page_width
+    left, _, right, _ = bounds
+    return max(1.0, right - left)
+
+
 def is_bold_font(font_name: str) -> bool:
     return any(marker in font_name.lower() for marker in ("bold", "black", "heavy", "demi"))
 
@@ -196,8 +216,36 @@ def fix_ltr_punctuation_in_rtl(value: str) -> str:
     return value
 
 
+def repair_split_ltr_citation(value: str) -> str:
+    def replacement(match: re.Match[str]) -> str:
+        prefix = normalize_text_spacing(match.group("prefix"))
+        hebrew = normalize_text_spacing(match.group("hebrew"))
+        author = normalize_text_spacing(match.group("author"))
+        year = match.group("year")
+        return f"{hebrew} ({prefix} {author}, {year})."
+
+    value = re.sub(
+        r"(?P<prefix>[A-Z][A-Za-z0-9\s.,&;:'\-\u2013]+&)\)?\s+"
+        r"(?P<hebrew>[\u0590-\u05ff][\u0590-\u05ff\s.,;:'\"\u05f3\u05f4\u05be\\-]+?)\s+"
+        r"(?P<year>\d{4}),\s*(?P<author>[A-Z][A-Za-z\s.'\-\u2013]+)\)\.?",
+        replacement,
+        value,
+    )
+    return re.sub(
+        r"\((?P<first_author>[A-Z][A-Za-z\s.'\-]+)\s+"
+        r"(?P<first_year>\d{4})\)\.\s+"
+        r"(?P<hebrew>[\u0590-\u05ff][\u0590-\u05ff\s.,;:'\"\u05f3\u05f4\u05be\\-]+?);\s+"
+        r"(?P<rest>[A-Z][A-Za-z0-9\s.,&;:'\-\u2013]+,\s*\d{4})(?=\s+[\u0590-\u05ff])",
+        lambda match: (
+            f"({normalize_text_spacing(match.group('first_author'))}, {match.group('first_year')}; "
+            f"{normalize_text_spacing(match.group('rest'))}). {normalize_text_spacing(match.group('hebrew'))}"
+        ),
+        value,
+    )
+
+
 def clean_extracted_text_line(value: str) -> str:
-    return fix_ltr_punctuation_in_rtl(normalize_text_spacing(value))
+    return repair_split_ltr_citation(fix_ltr_punctuation_in_rtl(normalize_text_spacing(value)))
 
 
 def has_hebrew(value: str) -> bool:
@@ -222,9 +270,14 @@ def canonical_match_text(value: str) -> str:
     return value.lower()
 
 
+def canonical_hebrew_text(value: str) -> str:
+    return "".join(re.findall(r"[\u0590-\u05ff]+", clean_extracted_text_line(value)))
+
+
 def style_line_similarity(correct_text: str, visual_line: dict) -> float:
     correct = canonical_match_text(correct_text)
-    visual = canonical_match_text(visual_line_to_text(str(visual_line.get("text", ""))))
+    visual_text = visual_line_to_text(str(visual_line.get("text", "")))
+    visual = canonical_match_text(visual_text)
     if not correct or not visual:
         return 0.0
     if correct == visual:
@@ -233,7 +286,49 @@ def style_line_similarity(correct_text: str, visual_line: dict) -> float:
         shorter = min(len(correct), len(visual))
         longer = max(len(correct), len(visual))
         return 0.92 * (shorter / longer)
+    correct_hebrew = canonical_hebrew_text(correct_text)
+    visual_hebrew = canonical_hebrew_text(visual_text)
+    if len(correct_hebrew) >= 8 and len(visual_hebrew) >= 8 and (correct_hebrew in visual_hebrew or visual_hebrew in correct_hebrew):
+        shorter = min(len(correct_hebrew), len(visual_hebrew))
+        longer = max(len(correct_hebrew), len(visual_hebrew))
+        return max(0.72, 0.94 * (shorter / longer))
     return difflib.SequenceMatcher(None, correct, visual).ratio()
+
+
+def best_style_line_match(correct_text: str, visual_lines: list[dict]) -> dict | None:
+    best: tuple[float, int, dict] | None = None
+    for visual_index, visual_line in enumerate(visual_lines):
+        score = style_line_similarity(correct_text, visual_line)
+        if best is None or score > best[0]:
+            best = (score, visual_index, visual_line)
+    if best is None:
+        return None
+    score, visual_index, visual_line = best
+    return {
+        "visual_index": visual_index,
+        "score": round(score, 3),
+        "visual_text": clean_extracted_text_line(visual_line_to_text(str(visual_line.get("text") or ""))),
+    }
+
+
+def line_debug_record(line: dict, index: int | None = None, role: str | None = None) -> dict:
+    record = {
+        "text": str(line.get("text") or ""),
+        "top": round(float(line.get("top") or 0.0), 2),
+        "bottom": round(float(line.get("bottom") or 0.0), 2),
+        "x0": round(float(line.get("x0") or 0.0), 2),
+        "x1": round(float(line.get("x1") or 0.0), 2),
+        "width": round(line_width(line), 2),
+        "size": round(float(line.get("size") or 0.0), 2),
+        "font": str(line.get("font") or ""),
+    }
+    if index is not None:
+        record["index"] = index
+    if role:
+        record["role"] = role
+    if line.get("noise_reason"):
+        record["noise_reason"] = str(line.get("noise_reason"))
+    return record
 
 
 def align_text_lines_to_style_lines(correct_text_lines: list[str], visual_lines: list[dict], require_visual_match: bool = False) -> list[dict]:
@@ -299,6 +394,16 @@ def align_text_lines_to_style_lines(correct_text_lines: list[str], visual_lines:
     return complete_lines
 
 
+def visual_lines_to_text_lines(visual_lines: list[dict]) -> list[dict]:
+    corrected: list[dict] = []
+    for visual_line in visual_lines:
+        line = dict(visual_line)
+        line["text"] = clean_extracted_text_line(visual_line_to_text(str(line.get("text") or "")))
+        corrected.append(line)
+    corrected.sort(key=lambda line: (float(line.get("top") or 0), float(line.get("x0") or 0)))
+    return corrected
+
+
 def line_from_words(words: list[dict]) -> dict:
     raw_text = " ".join(word.get("text", "") for word in words)
     text = normalize_text_spacing(raw_text)
@@ -329,6 +434,36 @@ def line_from_words(words: list[dict]) -> dict:
     }
 
 
+def split_words_by_horizontal_regions(words: list[dict], page_width: float) -> list[list[dict]]:
+    if not words:
+        return []
+
+    sorted_words = sorted(words, key=lambda item: float(item["x0"]))
+    average_size = dominant_number([float(word.get("size") or 0.0) for word in sorted_words])
+    gaps = [
+        float(sorted_words[index].get("x0") or 0.0) - float(sorted_words[index - 1].get("x1") or 0.0)
+        for index in range(1, len(sorted_words))
+    ]
+    positive_gaps = sorted(gap for gap in gaps if gap > 0)
+    baseline_gap = positive_gaps[max(0, len(positive_gaps) // 4)] if positive_gaps else average_size * 0.35
+    gap_threshold = max(page_width * 0.02, average_size * 1.4, baseline_gap * 1.8, 12.0)
+    regions: list[list[dict]] = []
+    current: list[dict] = []
+    previous_x1 = 0.0
+
+    for word in sorted_words:
+        x0 = float(word.get("x0") or 0.0)
+        if current and x0 - previous_x1 > gap_threshold:
+            regions.append(current)
+            current = []
+        current.append(word)
+        previous_x1 = max(previous_x1, float(word.get("x1") or x0))
+
+    if current:
+        regions.append(current)
+    return regions
+
+
 def cluster_visual_lines(words: list[dict], page_width: float, tolerance: float = 3.2) -> list[dict]:
     sorted_words = sorted(words, key=lambda item: (float(item["top"]), float(item["x0"])))
     clusters: list[list[dict]] = []
@@ -344,12 +479,13 @@ def cluster_visual_lines(words: list[dict], page_width: float, tolerance: float 
 
     lines: list[dict] = []
     for words_in_line in clusters:
-        words_in_line.sort(key=lambda item: float(item["x0"]))
-        line = line_from_words(words_in_line)
-        if line["x1"] < page_width * 0.34:
-            continue
-        if line["text"]:
-            lines.append(line)
+        for words_in_region in split_words_by_horizontal_regions(words_in_line, page_width):
+            words_in_region.sort(key=lambda item: float(item["x0"]))
+            line = line_from_words(words_in_region)
+            if line_width(line) < max(10.0, page_width * 0.025):
+                continue
+            if line["text"]:
+                lines.append(line)
     return lines
 
 
@@ -364,9 +500,26 @@ def style_attrs(size: float, font: str, body_size: float) -> tuple[list[str], st
     return classes, style_attr
 
 
+LTR_SEQUENCE_RE = re.compile(r"\(?[A-Za-z0-9][A-Za-z0-9\s.,;:&'\"()\-–/]*[A-Za-z0-9)&]\)?")
+
+
+def text_with_bidi_isolates(value: str) -> str:
+    parts: list[str] = []
+    last = 0
+    for match in LTR_SEQUENCE_RE.finditer(value):
+        start, end = match.span()
+        if start > last:
+            parts.append(html.escape(value[last:start]))
+        parts.append(f'<bdi dir="ltr">{html.escape(match.group(0))}</bdi>')
+        last = end
+    if last < len(value):
+        parts.append(html.escape(value[last:]))
+    return "".join(parts)
+
+
 def wrap_span(value: str, classes: list[str], style_attr: str) -> str:
     class_attr = f' class="{" ".join(classes)}"' if classes else ""
-    return f"<span{class_attr}{style_attr}>{html.escape(value)}</span>"
+    return f"<span{class_attr}{style_attr}>{text_with_bidi_isolates(value)}</span>"
 
 
 def styled_line_html(line: dict, body_size: float) -> str:
@@ -411,11 +564,11 @@ def styled_line_html(line: dict, body_size: float) -> str:
     last = 0
     for start, end, classes, style_attr in merged:
         if start > last:
-            parts.append(html.escape(text[last:start]))
+            parts.append(text_with_bidi_isolates(text[last:start]))
         parts.append(wrap_span(text[start:end], classes, style_attr))
         last = end
     if last < len(text):
-        parts.append(html.escape(text[last:]))
+        parts.append(text_with_bidi_isolates(text[last:]))
     return "".join(parts)
 
 
@@ -445,8 +598,458 @@ def lines_to_blocks(lines: list[dict], body_size: float) -> list[dict]:
         block["top"] = min(line["top"] for line in block["lines"])
         block["bottom"] = max(line["bottom"] for line in block["lines"])
         block["tag"] = "p"
+        block_text = " ".join(str(line.get("text") or "") for line in block["lines"])
+        repaired_block_text = repair_split_ltr_citation(block_text)
+        if repaired_block_text != block_text:
+            first_line = dict(block["lines"][0])
+            first_line["text"] = repaired_block_text
+            first_line["style_words"] = []
+            block["lines"] = [first_line]
+            block["html"] = wrap_span(repaired_block_text, [], "")
+        else:
+            block["html"] = " ".join(styled_line_html(line, body_size) for line in block["lines"])
+    return blocks
+
+
+def line_width(line: dict) -> float:
+    return max(0.0, float(line.get("x1") or 0.0) - float(line.get("x0") or 0.0))
+
+
+def estimate_body_band(lines: list[dict], body_size: float, page_width: float) -> tuple[float, float]:
+    candidates = [
+        line
+        for line in lines
+        if line_width(line) >= page_width * 0.45
+        and float(line.get("size") or body_size) >= body_size * 0.94
+    ]
+    if not candidates:
+        return page_width * 0.08, page_width * 0.92
+
+    x0_values = sorted(float(line.get("x0") or 0.0) for line in candidates)
+    x1_values = sorted(float(line.get("x1") or page_width) for line in candidates)
+    middle = len(candidates) // 2
+    median_x0 = x0_values[middle]
+    median_x1 = x1_values[middle]
+    padding = page_width * 0.05
+    return max(0.0, median_x0 - padding), min(page_width, median_x1 + padding)
+
+
+def is_likely_secondary_line(line: dict, body_size: float, page_width: float, body_band: tuple[float, float]) -> bool:
+    text = str(line.get("text") or "").strip()
+    if len(text) < 8 or page_width <= 0:
+        return False
+
+    size = float(line.get("size") or body_size)
+    width = line_width(line)
+    center = (float(line.get("x0") or 0.0) + float(line.get("x1") or 0.0)) / 2.0
+    body_left, body_right = body_band
+    outside_body = center < body_left or center > body_right
+    small = size <= body_size * 0.94
+    very_small = size <= body_size * 0.88
+    narrow = width <= page_width * 0.58
+    very_narrow = width <= page_width * 0.42
+    short = len(text) <= 115
+    looks_like_heading = size >= body_size * 1.06 or is_bold_font(str(line.get("font") or ""))
+
+    if looks_like_heading:
+        return False
+
+    score = 0
+    if small:
+        score += 2
+    if very_small:
+        score += 1
+    if narrow:
+        score += 1
+    if very_narrow:
+        score += 1
+    if outside_body:
+        score += 2
+    if short:
+        score += 1
+    return score >= 4
+
+
+def noise_reason_for_line(line: dict, page_width: float, page_height: float, body_size: float) -> str | None:
+    text = normalize_text_spacing(str(line.get("text") or ""))
+    if not text:
+        return "empty"
+
+    top = float(line.get("top") or 0.0)
+    bottom = float(line.get("bottom") or top)
+    size = float(line.get("size") or body_size)
+    top_margin = page_height > 0 and top <= page_height * 0.095
+    bottom_margin = page_height > 0 and bottom >= page_height * 0.925
+
+    if "File #" in text or "do not distribute" in text or "belongs to" in text:
+        return "watermark"
+    if "Book" in text and ".indb" in text:
+        return "footer_metadata"
+    if re.search(r"\b\d{2}/\d{2}/\d{4}\b", text):
+        return "footer_metadata"
+    if re.fullmatch(r"[A-Z](?:\s+[A-Z]){4,}", text):
+        return "watermark_letters"
+    if len(text) >= 8 and re.fullmatch(r"[_\-\s]+", text):
+        return "decorative_rule"
+    if bottom_margin:
+        return "footer"
+
+    has_hebrew_text = has_hebrew(text)
+    has_digit = bool(re.search(r"\d", text))
+    short_header = len(text) <= 95
+    if top_margin and short_header and (has_digit or has_hebrew_text) and size <= body_size * 1.05:
+        return "running_header"
+
+    if page_width > 0 and line_width(line) <= page_width * 0.08 and has_digit and (top_margin or bottom_margin):
+        return "page_number"
+    return None
+
+
+def split_noise_lines(lines: list[dict], page_width: float, page_height: float, body_size: float) -> tuple[list[dict], list[dict]]:
+    content_lines: list[dict] = []
+    noise_lines: list[dict] = []
+    for line in lines:
+        reason = noise_reason_for_line(line, page_width, page_height, body_size)
+        if reason:
+            item = dict(line)
+            item["noise_reason"] = reason
+            noise_lines.append(item)
+        else:
+            content_lines.append(line)
+    return content_lines, noise_lines
+
+
+def secondary_lines_to_blocks(lines: list[dict], body_size: float) -> list[dict]:
+    if not lines:
+        return []
+
+    blocks: list[dict] = []
+    max_gap = body_size * 1.35
+
+    def same_secondary_region(previous: dict, line: dict) -> bool:
+        horizontal_gap = max(
+            float(line.get("x0") or 0.0) - float(previous.get("x1") or 0.0),
+            float(previous.get("x0") or 0.0) - float(line.get("x1") or 0.0),
+            0.0,
+        )
+        overlap = min(float(previous.get("x1") or 0.0), float(line.get("x1") or 0.0)) - max(float(previous.get("x0") or 0.0), float(line.get("x0") or 0.0))
+        return overlap > 0 or horizontal_gap <= body_size * 0.75
+
+    for line in sorted(lines, key=lambda item: (float(item["top"]), float(item["x0"]))):
+        matching_block = None
+        for block in reversed(blocks):
+            previous = block["lines"][-1]
+            if float(line["top"]) - float(previous["bottom"]) <= max_gap and same_secondary_region(previous, line):
+                matching_block = block
+                break
+        if matching_block is None:
+            blocks.append({"lines": [line]})
+        else:
+            matching_block["lines"].append(line)
+
+    for block in blocks:
+        block["top"] = min(line["top"] for line in block["lines"])
+        block["bottom"] = max(line["bottom"] for line in block["lines"])
+        block["tag"] = "aside"
+        block["class"] = "caption"
         block["html"] = " ".join(styled_line_html(line, body_size) for line in block["lines"])
     return blocks
+
+
+def separate_secondary_text(lines: list[dict], body_size: float, page_width: float) -> tuple[list[dict], list[dict]]:
+    body_band = estimate_body_band(lines, body_size, page_width)
+    flow_lines: list[dict] = []
+    secondary_lines: list[dict] = []
+    for line in lines:
+        if is_likely_secondary_line(line, body_size, page_width, body_band):
+            secondary_lines.append(line)
+        else:
+            flow_lines.append(line)
+    return flow_lines, secondary_lines_to_blocks(secondary_lines, body_size)
+
+
+def is_question_callout_title(text: str) -> bool:
+    return "שאלו" in text and "עצמכם" in text
+
+
+def question_column_items(lines: list[dict]) -> list[str]:
+    items: list[str] = []
+    current: list[str] = []
+    for line in sorted(lines, key=lambda item: (float(item.get("top") or 0.0), -float(item.get("x1") or 0.0))):
+        text = normalize_text_spacing(str(line.get("text") or ""))
+        if not text:
+            continue
+        if text.startswith("•"):
+            if current:
+                items.append(normalize_text_spacing(" ".join(current)))
+            current = [text.lstrip("•").strip()]
+        elif current:
+            current.append(text)
+        else:
+            current = [text]
+    if current:
+        items.append(normalize_text_spacing(" ".join(current)))
+    return items
+
+
+def build_question_callout_block(title_line: dict, content_lines: list[dict], body_size: float) -> dict:
+    sorted_content = sorted(content_lines, key=lambda item: float(item.get("x0") or 0.0))
+    centers = [
+        (float(line.get("x0") or 0.0) + float(line.get("x1") or 0.0)) / 2
+        for line in sorted_content
+    ]
+    split_at = None
+    if len(centers) >= 2:
+        gaps = [(centers[index] - centers[index - 1], index) for index in range(1, len(centers))]
+        largest_gap, gap_index = max(gaps, key=lambda item: item[0])
+        if largest_gap >= body_size * 2.5:
+            split_at = gap_index
+
+    if split_at is None:
+        columns = [sorted_content]
+    else:
+        columns = [sorted_content[:split_at], sorted_content[split_at:]]
+        columns.sort(
+            key=lambda column: sum(float(line.get("x1") or 0.0) for line in column) / max(len(column), 1),
+            reverse=True,
+        )
+
+    column_html: list[str] = []
+    plain_lines = [dict(title_line)]
+    plain_lines[0]["text"] = normalize_text_spacing(str(title_line.get("text") or ""))
+    for column in columns:
+        items = question_column_items(column)
+        for item in items:
+            plain_lines.append({"text": item, "top": title_line["top"], "bottom": title_line["bottom"]})
+        items_html = "".join(f"<li>{text_with_bidi_isolates(item)}</li>" for item in items)
+        column_html.append(f"<ul>{items_html}</ul>")
+
+    title = normalize_text_spacing(str(title_line.get("text") or ""))
+    top = min(float(line.get("top") or 0.0) for line in [title_line] + content_lines)
+    bottom = max(float(line.get("bottom") or line.get("top") or 0.0) for line in [title_line] + content_lines)
+    return {
+        "tag": "aside",
+        "class": "question-box",
+        "top": top,
+        "bottom": bottom,
+        "reading_top": top,
+        "lines": plain_lines,
+        "html": (
+            f"<h3>{text_with_bidi_isolates(title)}</h3>"
+            f'<div class="question-columns">{"".join(column_html)}</div>'
+        ),
+    }
+
+
+def extract_question_callouts(flow_lines: list[dict], visual_lines: list[dict], body_size: float) -> tuple[list[dict], list[dict]]:
+    visual_text_lines = visual_lines_to_text_lines(visual_lines)
+    callouts: list[dict] = []
+    ranges: list[tuple[float, float]] = []
+
+    for title_line in visual_text_lines:
+        if not is_question_callout_title(str(title_line.get("text") or "")):
+            continue
+        title_top = float(title_line.get("top") or 0.0)
+        candidates = [
+            line
+            for line in visual_text_lines
+            if title_top < float(line.get("top") or 0.0) <= title_top + body_size * 22
+        ]
+        candidates.sort(key=lambda item: float(item.get("top") or 0.0))
+        content_lines: list[dict] = []
+        previous_bottom = float(title_line.get("bottom") or title_top)
+        for line in candidates:
+            gap = float(line.get("top") or 0.0) - previous_bottom
+            if content_lines and gap > body_size * 3.0:
+                break
+            content_lines.append(line)
+            previous_bottom = max(previous_bottom, float(line.get("bottom") or line.get("top") or previous_bottom))
+        if not content_lines:
+            continue
+        block = build_question_callout_block(title_line, content_lines, body_size)
+        callouts.append(block)
+        ranges.append((float(block["top"]) - body_size * 0.4, float(block["bottom"]) + body_size * 0.4))
+
+    if not ranges:
+        return flow_lines, []
+
+    remaining = [
+        line
+        for line in flow_lines
+        if not any(start <= float(line.get("top") or 0.0) <= end for start, end in ranges)
+    ]
+    return remaining, callouts
+
+
+def block_bounds(block: dict, page_width: float) -> tuple[float, float, float, float]:
+    lines = block.get("lines", [])
+    tops = [float(line.get("top") or 0.0) for line in lines]
+    bottoms = [float(line.get("bottom") or line.get("top") or 0.0) for line in lines]
+    x0_values = [float(line.get("x0") or 0.0) for line in lines if float(line.get("x1") or 0.0) > float(line.get("x0") or 0.0)]
+    x1_values = [float(line.get("x1") or 0.0) for line in lines if float(line.get("x1") or 0.0) > float(line.get("x0") or 0.0)]
+    top = min(tops) if tops else float(block.get("top") or 0.0)
+    bottom = max(bottoms) if bottoms else float(block.get("bottom") or top)
+    x0 = min(x0_values) if x0_values else 0.0
+    x1 = max(x1_values) if x1_values else page_width
+    return x0, top, x1, bottom
+
+
+def horizontal_zone(x0: float, x1: float, page_width: float) -> str:
+    if page_width <= 0:
+        return "unknown"
+    width_ratio = (x1 - x0) / page_width
+    center_ratio = ((x0 + x1) / 2) / page_width
+    if width_ratio >= 0.64:
+        return "full"
+    if center_ratio >= 0.55:
+        return "right"
+    if center_ratio <= 0.45:
+        return "left"
+    return "center"
+
+
+def layout_region_record(region_id: str, kind: str, block: dict, page_width: float, order: int) -> dict:
+    x0, top, x1, bottom = block_bounds(block, page_width)
+    record = {
+        "id": region_id,
+        "kind": kind,
+        "order": order,
+        "top": round(top, 2),
+        "bottom": round(bottom, 2),
+        "x0": round(x0, 2),
+        "x1": round(x1, 2),
+        "zone": horizontal_zone(x0, x1, page_width),
+        "text": block_plain_text(block),
+        "line_count": len(block.get("lines", [])),
+    }
+    if block.get("class") == "question-box":
+        record["internal_flow"] = "rtl_columns"
+    return record
+
+
+def table_region_record(table: dict, page_width: float, order: int) -> dict:
+    x0 = float(table.get("x0") or 0.0)
+    x1 = float(table.get("x1") or page_width)
+    return {
+        "id": f"table-{int(table.get('index') or order)}",
+        "kind": "table",
+        "order": order,
+        "top": round(float(table.get("top") or 0.0), 2),
+        "bottom": round(float(table.get("bottom") or table.get("top") or 0.0), 2),
+        "x0": round(x0, 2),
+        "x1": round(x1, 2),
+        "zone": horizontal_zone(x0, x1, page_width),
+        "rows": int(table.get("rows") or 0),
+        "cols": int(table.get("cols") or 0),
+        "reconstructed": bool(table.get("reconstructed")),
+    }
+
+
+def layout_item_bounds(item: dict, kind: str, page_width: float) -> tuple[float, float, float, float]:
+    if kind == "table":
+        return (
+            float(item.get("x0") or 0.0),
+            float(item.get("top") or 0.0),
+            float(item.get("x1") or page_width),
+            float(item.get("bottom") or item.get("top") or 0.0),
+        )
+    return block_bounds(item, page_width)
+
+
+def sort_layout_items(items: list[tuple[str, dict]], page_width: float, body_size: float) -> list[tuple[str, dict]]:
+    if not items:
+        return []
+
+    def top_of(entry: tuple[str, dict]) -> float:
+        kind, item = entry
+        return float(item.get("reading_top", item.get("top", 0.0))) if kind != "table" else float(item.get("top") or 0.0)
+
+    ordered = sorted(items, key=top_of)
+    groups: list[list[tuple[str, dict]]] = []
+    tolerance = max(body_size * 1.35, 12.0)
+    for entry in ordered:
+        top = top_of(entry)
+        if not groups or top - min(top_of(group_item) for group_item in groups[-1]) > tolerance:
+            groups.append([entry])
+        else:
+            groups[-1].append(entry)
+
+    zone_rank = {"right": 0, "full": 1, "center": 1, "unknown": 1, "left": 2}
+    kind_rank = {"body": 0, "question": 1, "caption": 2, "table": 3}
+    result: list[tuple[str, dict]] = []
+    for group in groups:
+        if len(group) == 1:
+            result.extend(group)
+            continue
+
+        def group_key(entry: tuple[str, dict]) -> tuple[int, int, float]:
+            kind, item = entry
+            x0, _, x1, _ = layout_item_bounds(item, kind, page_width)
+            zone = horizontal_zone(x0, x1, page_width)
+            return zone_rank.get(zone, 1), kind_rank.get(kind, 9), top_of(entry)
+
+        result.extend(sorted(group, key=group_key))
+    return result
+
+
+def build_layout_regions(body_blocks: list[dict], secondary_blocks: list[dict], tables: list[dict], page_width: float) -> list[dict]:
+    items: list[tuple[str, dict]] = []
+    for block in body_blocks:
+        kind = "question" if block.get("class") == "question-box" else "body"
+        items.append((kind, block))
+    for block in secondary_blocks:
+        items.append(("caption", block))
+    for table in tables:
+        if table.get("reconstructed") or (table.get("data") and table.get("cols", 0) > 1):
+            items.append(("table", table))
+
+    regions: list[dict] = []
+    body_size = dominant_number(
+        [
+            float(line.get("size") or 0.0)
+            for _, item in items
+            if isinstance(item, dict)
+            for line in item.get("lines", [])
+        ],
+        fallback=12.0,
+    )
+    for order, (kind, item) in enumerate(sort_layout_items(items, page_width, body_size), start=1):
+        if kind == "table":
+            regions.append(table_region_record(item, page_width, order))
+        else:
+            regions.append(layout_region_record(f"{kind}-{order}", kind, item, page_width, order))
+    return regions
+
+
+def block_plain_text(block: dict) -> str:
+    return normalize_text_spacing(" ".join(str(line.get("text") or "") for line in block.get("lines", [])))
+
+
+def block_ends_sentence(block: dict) -> bool:
+    text = block_plain_text(block).rstrip()
+    if not text:
+        return True
+    return text[-1] in ".!?:;؟׃"
+
+
+def assign_secondary_reading_order(body_blocks: list[dict], secondary_blocks: list[dict], body_size: float) -> None:
+    ordered_body = sorted(body_blocks, key=lambda block: float(block["top"]))
+    for block in secondary_blocks:
+        top = float(block["top"])
+        reading_top = top
+        previous_body = next((candidate for candidate in reversed(ordered_body) if float(candidate["top"]) <= top), None)
+        following_body = next((candidate for candidate in ordered_body if float(candidate["top"]) > top), None)
+
+        if previous_body and top <= float(previous_body["bottom"]):
+            reading_top = float(previous_body["bottom"]) + 0.01
+        elif previous_body and following_body:
+            gap = float(following_body["top"]) - float(previous_body["bottom"])
+            block_height = float(block["bottom"]) - top
+            max_interruption_gap = max(body_size * 8.0, block_height + body_size * 4.0)
+            if gap <= max_interruption_gap or not block_ends_sentence(previous_body):
+                reading_top = float(following_body["bottom"]) + 0.01
+
+        block["reading_top"] = reading_top
 
 
 def clean_table_cell(value: object) -> str:
@@ -762,10 +1365,15 @@ def extract_pdf_structured(
                 extra_attrs=["fontname", "size"],
             )
             words = filter_words_by_crop(words, crop_bounds)
-            lines = cluster_visual_lines(words, float(page.width))
+            layout_width = layout_width_for_bounds(float(page.width), crop_bounds)
+            layout_words = normalize_words_to_layout_bounds(words, crop_bounds)
+            lines = cluster_visual_lines(layout_words, layout_width)
             tables = detect_tables(page, crop_bounds)
             correct_text_lines = text_pages[page_number - 1] if page_number <= len(text_pages) else []
-            corrected_lines = align_text_lines_to_style_lines(correct_text_lines, lines, require_visual_match=crop_enabled) if correct_text_lines else lines
+            if crop_enabled:
+                corrected_lines = align_text_lines_to_style_lines(correct_text_lines, lines, require_visual_match=True) if correct_text_lines else visual_lines_to_text_lines(lines)
+            else:
+                corrected_lines = align_text_lines_to_style_lines(correct_text_lines, lines) if correct_text_lines else visual_lines_to_text_lines(lines)
 
             table_order_lines = text_lines_to_records(correct_text_lines)
             tables.extend(
@@ -775,7 +1383,7 @@ def extract_pdf_structured(
                     fallback_lines=table_order_lines,
                 )
             )
-            pages.append({"number": page_number, "lines": corrected_lines, "tables": tables})
+            pages.append({"number": page_number, "width": layout_width, "height": float(page.height), "lines": corrected_lines, "visual_lines": lines, "tables": tables})
             all_lines.extend(corrected_lines)
 
     if page_numbers and not pages:
@@ -785,61 +1393,251 @@ def extract_pdf_structured(
     total_chars = sum(len(line["text"]) for line in all_lines)
 
     for page in pages:
-        flow_lines = [
+        non_table_lines = [
             line
             for line in page["lines"]
             if not line_overlaps_table(line, page.get("tables", []))
         ]
+        content_lines, noise_lines = split_noise_lines(non_table_lines, float(page.get("width") or 0.0), float(page.get("height") or 0.0), body_size)
+        flow_lines, secondary_blocks = separate_secondary_text(content_lines, body_size, float(page.get("width") or 0.0))
+        flow_lines, question_blocks = extract_question_callouts(flow_lines, page.get("visual_lines", []), body_size)
         page["blocks"] = lines_to_blocks(flow_lines, body_size)
+        page["blocks"].extend(question_blocks)
+        assign_secondary_reading_order(page["blocks"], secondary_blocks, body_size)
+        page["secondary_blocks"] = secondary_blocks
+        page["noise_lines"] = noise_lines
+        page["regions"] = build_layout_regions(page["blocks"], secondary_blocks, page.get("tables", []), float(page.get("width") or 0.0))
 
     plain_text_parts: list[str] = []
     for page in pages:
         plain_text_parts.append(f"--- עמוד {page['number']} ---")
-        for block in page["blocks"]:
-            plain_text_parts.append(" ".join(line["text"] for line in block["lines"]))
+        reading_items: list[tuple[str, dict]] = []
+        for block in page["blocks"] + page.get("secondary_blocks", []):
+            kind = "caption" if block.get("class") == "caption" else "question" if block.get("class") == "question-box" else "body"
+            reading_items.append((kind, block))
         for table in page.get("tables", []):
             if table.get("reconstructed") or (table.get("data") and table.get("cols", 0) > 1):
+                reading_items.append(("table", table))
+
+        for kind, item in sort_layout_items(reading_items, float(page.get("width") or 0.0), body_size):
+            if kind == "table":
+                table = item
                 for row in table.get("data", []):
                     plain_text_parts.append(" | ".join(row))
+            else:
+                prefix = "[Caption] " if kind == "caption" else ""
+                plain_text_parts.append(prefix + " ".join(line["text"] for line in item["lines"]))
         plain_text_parts.append("")
 
     return pages, "\n".join(plain_text_parts).strip() + "\n", len(pages), total_chars
+
+
+def build_layout_debug_report(
+    pdf_path: Path,
+    crop_settings: dict | None = None,
+    page_numbers: set[int] | None = None,
+) -> dict:
+    pdf_path = pdf_path.expanduser().resolve()
+    crop_settings = normalize_crop_settings(crop_settings)
+    crop_enabled = crop_settings_enabled(crop_settings)
+    pypdf_reader = PdfReader(str(pdf_path))
+    text_pages = [
+        [line.strip() for line in (page.extract_text() or "").splitlines() if line.strip()]
+        for page in pypdf_reader.pages
+    ]
+    report_pages: list[dict] = []
+    all_corrected_lines: list[dict] = []
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            if page_numbers and page_number not in page_numbers:
+                continue
+            crop_bounds = page_crop_bounds(float(page.width), float(page.height), page_number, crop_settings) if crop_enabled else None
+            raw_words = page.extract_words(
+                keep_blank_chars=False,
+                use_text_flow=True,
+                extra_attrs=["fontname", "size"],
+            )
+            cropped_words = filter_words_by_crop(raw_words, crop_bounds)
+            layout_width = layout_width_for_bounds(float(page.width), crop_bounds)
+            layout_words = normalize_words_to_layout_bounds(cropped_words, crop_bounds)
+            visual_lines = cluster_visual_lines(layout_words, layout_width)
+            logical_lines = text_pages[page_number - 1] if page_number <= len(text_pages) else []
+            if crop_enabled:
+                corrected_lines = align_text_lines_to_style_lines(logical_lines, visual_lines, require_visual_match=True) if logical_lines else visual_lines_to_text_lines(visual_lines)
+            else:
+                corrected_lines = align_text_lines_to_style_lines(logical_lines, visual_lines) if logical_lines else visual_lines_to_text_lines(visual_lines)
+
+            table_order_lines = text_lines_to_records(logical_lines)
+            tables = detect_tables(page, crop_bounds)
+            tables.extend(
+                detect_text_table_markers(
+                    corrected_lines,
+                    start_index=len(tables) + 1,
+                    fallback_lines=table_order_lines,
+                )
+            )
+
+            report_pages.append(
+                {
+                    "number": page_number,
+                    "page_width": round(float(page.width), 2),
+                    "page_height": round(float(page.height), 2),
+                    "layout_width": round(layout_width, 2),
+                    "crop_bounds": [round(float(value), 2) for value in crop_bounds] if crop_bounds else None,
+                    "word_counts": {
+                        "raw": len(raw_words),
+                        "after_crop": len(cropped_words),
+                    },
+                    "pypdf_lines": [
+                        {
+                            "index": index,
+                            "text": clean_extracted_text_line(text),
+                            "best_visual_match": best_style_line_match(text, visual_lines),
+                        }
+                        for index, text in enumerate(logical_lines)
+                    ],
+                    "visual_lines": [
+                        line_debug_record(line, index=index, role="visual")
+                        for index, line in enumerate(visual_lines)
+                    ],
+                    "corrected_lines": [
+                        line_debug_record(line, index=index, role="corrected")
+                        for index, line in enumerate(corrected_lines)
+                    ],
+                    "tables": [
+                        {
+                            "index": table.get("index"),
+                            "top": round(float(table.get("top") or 0.0), 2),
+                            "bottom": round(float(table.get("bottom") or 0.0), 2),
+                            "rows": table.get("rows"),
+                            "cols": table.get("cols"),
+                            "estimated": bool(table.get("estimated")),
+                            "reconstructed": bool(table.get("reconstructed")),
+                            "sample": table.get("sample", ""),
+                        }
+                        for table in tables
+                    ],
+                    "_corrected_lines_for_classification": corrected_lines,
+                    "_visual_lines_for_classification": visual_lines,
+                    "_tables_for_classification": tables,
+                }
+            )
+            all_corrected_lines.extend(corrected_lines)
+
+    body_size = dominant_number([line["size"] for line in all_corrected_lines])
+    for page_report in report_pages:
+        corrected_lines = page_report.pop("_corrected_lines_for_classification")
+        visual_lines = page_report.pop("_visual_lines_for_classification")
+        tables = page_report.pop("_tables_for_classification")
+        non_table_lines = [line for line in corrected_lines if not line_overlaps_table(line, tables)]
+        content_lines, noise_lines = split_noise_lines(
+            non_table_lines,
+            float(page_report["layout_width"]),
+            float(page_report["page_height"]),
+            body_size,
+        )
+        flow_lines, secondary_blocks = separate_secondary_text(content_lines, body_size, float(page_report["layout_width"]))
+        flow_lines, question_blocks = extract_question_callouts(flow_lines, visual_lines, body_size)
+        body_blocks = lines_to_blocks(flow_lines, body_size)
+        body_blocks.extend(question_blocks)
+        assign_secondary_reading_order(body_blocks, secondary_blocks, body_size)
+        page_report["classification"] = {
+            "body_lines": [line_debug_record(line, role="body") for line in flow_lines],
+            "noise_lines": [line_debug_record(line, role="noise") for line in noise_lines],
+            "caption_blocks": [
+                {
+                    "top": round(float(block.get("top") or 0.0), 2),
+                    "bottom": round(float(block.get("bottom") or 0.0), 2),
+                    "reading_top": round(float(block.get("reading_top", block.get("top", 0.0))), 2),
+                    "text": block_plain_text(block),
+                    "lines": [line_debug_record(line, role="caption") for line in block.get("lines", [])],
+                }
+                for block in secondary_blocks
+            ],
+            "question_blocks": [
+                {
+                    "top": round(float(block.get("top") or 0.0), 2),
+                    "bottom": round(float(block.get("bottom") or 0.0), 2),
+                    "text": block_plain_text(block),
+                    "lines": [line_debug_record(line, role="question") for line in block.get("lines", [])],
+                }
+                for block in question_blocks
+            ],
+            "body_blocks": [
+                {
+                    "top": round(float(block.get("top") or 0.0), 2),
+                    "bottom": round(float(block.get("bottom") or 0.0), 2),
+                    "ends_sentence": block_ends_sentence(block),
+                    "text": block_plain_text(block),
+                }
+                for block in body_blocks
+            ],
+            "regions": build_layout_regions(body_blocks, secondary_blocks, tables, float(page_report["layout_width"])),
+        }
+
+    return {
+        "source": str(pdf_path),
+        "requested_pages": page_range_label(page_numbers),
+        "crop_enabled": crop_enabled,
+        "crop_settings": crop_settings,
+        "pages": report_pages,
+    }
+
+
+def write_layout_debug_report(
+    pdf_path: Path,
+    output_dir: Path,
+    crop_settings: dict | None = None,
+    page_numbers: set[int] | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report = build_layout_debug_report(pdf_path, crop_settings=crop_settings, page_numbers=page_numbers)
+    output_path = output_dir / f"{safe_slug(pdf_path.name)}-layout-debug.json"
+    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output_path
 
 
 def pages_to_html(pages: list[dict]) -> str:
     page_html: list[str] = []
     for page in pages:
         page_items = []
-        for block in page["blocks"]:
-            tag = block["tag"]
-            page_items.append(
-                {
-                    "top": block["top"],
-                    "html": f"<{tag}>{block['html']}</{tag}>",
-                }
-            )
+        reading_items: list[tuple[str, dict]] = []
+        for block in page["blocks"] + page.get("secondary_blocks", []):
+            kind = "caption" if block.get("class") == "caption" else "question" if block.get("class") == "question-box" else "body"
+            reading_items.append((kind, block))
         for table in page.get("tables", []):
-            sample = f'<div class="table-sample">{html.escape(table["sample"])}</div>' if table["sample"] else ""
-            if table.get("reconstructed"):
-                certainty = "טבלה משוחזרת"
+            if table.get("reconstructed") or (table.get("data") and table.get("cols", 0) > 1):
+                reading_items.append(("table", table))
+
+        body_size = dominant_number([float(line.get("size") or 0.0) for line in page.get("lines", [])], fallback=12.0)
+        for kind, item in sort_layout_items(reading_items, float(page.get("width") or 0.0), body_size):
+            if kind == "table":
+                table = item
+                sample = f'<div class="table-sample">{html.escape(table["sample"])}</div>' if table["sample"] else ""
+                if table.get("reconstructed"):
+                    certainty = "טבלה משוחזרת"
+                else:
+                    certainty = "טבלה אפשרית" if table.get("estimated") else "טבלה"
+                cols_text = f' · {table["cols"]} עמודות' if table["cols"] else ""
+                preview = table_data_to_html(table.get("data", []), estimated=bool(table.get("estimated")))
+                page_items.append(
+                    {
+                        "html": (
+                            '<aside class="table-detection">'
+                            f'<strong>זוהתה {certainty}</strong>'
+                            f'<span>עמוד {page["number"]}, טבלה {table["index"]} · '
+                            f'{table["rows"]} שורות{cols_text}</span>'
+                            f"{sample}{preview}"
+                            "</aside>"
+                        ),
+                    }
+                )
             else:
-                certainty = "טבלה אפשרית" if table.get("estimated") else "טבלה"
-            cols_text = f' · {table["cols"]} עמודות' if table["cols"] else ""
-            preview = table_data_to_html(table.get("data", []), estimated=bool(table.get("estimated")))
-            page_items.append(
-                {
-                    "top": table["top"],
-                    "html": (
-                        '<aside class="table-detection">'
-                        f'<strong>זוהתה {certainty}</strong>'
-                        f'<span>עמוד {page["number"]}, טבלה {table["index"]} · '
-                        f'{table["rows"]} שורות{cols_text}</span>'
-                        f"{sample}{preview}"
-                        "</aside>"
-                    ),
-                }
-            )
-        page_items.sort(key=lambda item: item["top"])
+                block = item
+                tag = block["tag"]
+                class_attr = f' class="{html.escape(str(block["class"]))}"' if block.get("class") else ""
+                page_items.append({"html": f"<{tag}{class_attr}>{block['html']}</{tag}>"})
         page_html.append(
             f'<section class="page" id="page-{page["number"]}">'
             f'<div class="page-marker">עמוד {page["number"]}</div>'
@@ -891,6 +1689,7 @@ def build_conversion_report(
     structured: bool,
 ) -> dict:
     tables = [table for page in pages for table in page.get("tables", [])]
+    secondary_blocks = [block for page in pages for block in page.get("secondary_blocks", [])]
     converted_page_numbers = [int(page["number"]) for page in pages]
     return {
         "mode": "structured" if structured else "plain text fallback",
@@ -902,6 +1701,7 @@ def build_conversion_report(
         "tables_detected": len(tables),
         "tables_reconstructed": sum(1 for table in tables if table.get("reconstructed")),
         "possible_tables": sum(1 for table in tables if table.get("estimated") and not table.get("reconstructed")),
+        "secondary_blocks": len(secondary_blocks),
     }
 
 
@@ -916,6 +1716,7 @@ def conversion_report_to_html(report: dict | None) -> str:
         ("Tables detected", report.get("tables_detected", 0)),
         ("Tables reconstructed", report.get("tables_reconstructed", 0)),
         ("Possible tables", report.get("possible_tables", 0)),
+        ("Captions / side text", report.get("secondary_blocks", 0)),
     ]
     rows_html = "".join(
         f"<dt>{html.escape(str(label))}</dt><dd>{html.escape(str(value))}</dd>"
@@ -1068,6 +1869,43 @@ def build_reader_html(
     .content p {{
       margin: 0 0 1.05em;
     }}
+    .content .caption {{
+      margin: .9em 0 1.15em;
+      border-inline-start: 4px solid var(--line);
+      padding: .55em .8em;
+      background: color-mix(in srgb, var(--paper) 82%, var(--accent-soft));
+      color: var(--muted);
+      font-size: .88em;
+      line-height: 1.65;
+    }}
+    .content .question-box {{
+      margin: 1.1em 0 1.35em;
+      border: 1px solid var(--accent-soft);
+      border-radius: 7px;
+      padding: .9em 1em;
+      background: color-mix(in srgb, var(--paper) 72%, var(--accent-soft));
+      font-size: .9em;
+      line-height: 1.62;
+    }}
+    .content .question-box h3 {{
+      margin: 0 0 .65em;
+      color: var(--accent);
+      font-size: 1.02em;
+      line-height: 1.35;
+      text-align: right;
+    }}
+    .content .question-columns {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1.1em;
+    }}
+    .content .question-box ul {{
+      margin: 0;
+      padding-inline-start: 1.1em;
+    }}
+    .content .question-box li {{
+      margin: 0 0 .55em;
+    }}
     .content h2 {{
       margin: 0 0 .85em;
       font-size: calc(var(--reader-size) * 1.2);
@@ -1217,6 +2055,7 @@ def build_reader_html(
       button, select {{ flex: 1 1 auto; }}
       main {{ padding-inline: 10px; }}
       .reader {{ border-inline: 0; padding-inline: 18px; }}
+      .content .question-columns {{ grid-template-columns: 1fr; }}
       .table-preview-wrap {{
         overflow-x: auto;
         overscroll-behavior-inline: contain;
@@ -2154,6 +2993,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--right-crop", help="Odd/right page crop as top,right,bottom,left percentages")
     parser.add_argument("--left-crop", help="Even/left page crop as top,right,bottom,left percentages")
     parser.add_argument("--pages", help="Optional page range to convert, for example: 1-5,8,12")
+    parser.add_argument("--debug-layout", action="store_true", help="Write a JSON layout debug report instead of a reader")
     args = parser.parse_args(argv)
 
     if args.serve:
@@ -2170,12 +3010,21 @@ def main(argv: list[str] | None = None) -> int:
                 "left": parse_crop_argument(args.left_crop),
             }
         )
-        output_path = create_reader(
-            Path(args.pdf),
-            Path(args.output_dir),
-            crop_settings=crop_settings,
-            page_numbers=parse_page_ranges(args.pages),
-        )
+        page_numbers = parse_page_ranges(args.pages)
+        if args.debug_layout:
+            output_path = write_layout_debug_report(
+                Path(args.pdf),
+                Path(args.output_dir),
+                crop_settings=crop_settings,
+                page_numbers=page_numbers,
+            )
+        else:
+            output_path = create_reader(
+                Path(args.pdf),
+                Path(args.output_dir),
+                crop_settings=crop_settings,
+                page_numbers=page_numbers,
+            )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

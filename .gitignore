@@ -10,6 +10,7 @@ venv/
 generated-readers/
 outputs/
 work/
+input/
 
 # Local runtime logs
 *.log

@@ -1,2 +1,3 @@
 pdfplumber>=0.11
 pypdf>=5
+Pillow>=10

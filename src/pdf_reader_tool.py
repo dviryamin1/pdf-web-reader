@@ -4,6 +4,7 @@ import argparse
 import base64
 import difflib
 import html
+import io
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 import pdfplumber
+from PIL import Image
 from pypdf import PdfReader
 
 
@@ -27,6 +29,10 @@ DEFAULT_OUTPUT_DIR = PROJECT_DIR / "generated-readers"
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
 BUNDLED_PDFTOPPM = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "native" / "poppler" / "Library" / "bin" / "pdftoppm.exe"
 PDFTOPPM = Path(os.environ["PDFTOPPM_PATH"]) if os.environ.get("PDFTOPPM_PATH") else Path(shutil.which("pdftoppm") or BUNDLED_PDFTOPPM)
+IMAGE_RENDER_DPI = 120
+IMAGE_MAX_EMBED_WIDTH = 900
+IMAGE_JPEG_QUALITY = 84
+IMAGE_CAPTION_CONFIDENCE_THRESHOLD = 0.55
 DEFAULT_CROP_SETTINGS = {
     "right": {"top": 0.0, "right": 0.0, "bottom": 0.0, "left": 0.0},
     "left": {"top": 0.0, "right": 0.0, "bottom": 0.0, "left": 0.0},
@@ -35,7 +41,7 @@ DEFAULT_CROP_SETTINGS = {
 
 def safe_slug(value: str) -> str:
     stem = Path(value).stem.strip() or "pdf-reader"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")
+    slug = re.sub(r"[^\w.-]+", "-", stem, flags=re.UNICODE).strip("-._")
     return slug or "pdf-reader"
 
 
@@ -122,6 +128,21 @@ def page_range_label(page_numbers: set[int] | None) -> str:
         start = previous = page
     ranges.append(str(start) if start == previous else f"{start}-{previous}")
     return ", ".join(ranges)
+
+
+def requested_page_indices(total_pages: int, page_numbers: set[int] | None) -> list[int]:
+    if not page_numbers:
+        return list(range(total_pages))
+    return [page_number - 1 for page_number in sorted(page_numbers) if 1 <= page_number <= total_pages]
+
+
+def extract_requested_text_pages(reader: PdfReader, page_numbers: set[int] | None) -> dict[int, list[str]]:
+    text_pages: dict[int, list[str]] = {}
+    for page_index in requested_page_indices(len(reader.pages), page_numbers):
+        page_number = page_index + 1
+        page_text = reader.pages[page_index].extract_text() or ""
+        text_pages[page_number] = [line.strip() for line in page_text.splitlines() if line.strip()]
+    return text_pages
 
 
 def page_side(page_number: int) -> str:
@@ -572,7 +593,48 @@ def styled_line_html(line: dict, body_size: float) -> str:
     return "".join(parts)
 
 
-def lines_to_blocks(lines: list[dict], body_size: float) -> list[dict]:
+def rtl_indented_paragraph_starts(lines: list[dict], body_size: float, page_width: float) -> set[int]:
+    if len(lines) < 3 or page_width <= 0:
+        return set()
+    hebrew_lines = [line for line in lines if has_hebrew(str(line.get("text") or ""))]
+    if len(hebrew_lines) < 3 or len(hebrew_lines) / len(lines) < 0.55:
+        return set()
+
+    right_edges = [float(line.get("x1") or 0.0) for line in hebrew_lines if float(line.get("x1") or 0.0) > 0.0]
+    if not right_edges:
+        return set()
+    right_margin = dominant_number(right_edges, fallback=max(right_edges))
+    indent_threshold = max(body_size * 0.75, page_width * 0.015)
+    max_first_line_indent = max(body_size * 2.8, page_width * 0.065)
+    aligned_tolerance = indent_threshold * 0.55
+    sentence_end = re.compile(r"[.!?;:\u05c3][\"'\u05f4\u201d)]*\s*$")
+
+    starts: set[int] = set()
+    for index in range(1, len(lines) - 1):
+        previous = lines[index - 1]
+        current = lines[index]
+        following = lines[index + 1]
+        current_text = str(current.get("text") or "").strip()
+        previous_text = str(previous.get("text") or "").strip()
+        if not has_hebrew(current_text) or not has_hebrew(str(following.get("text") or "")):
+            continue
+        gap = float(current.get("top") or 0.0) - float(previous.get("bottom") or 0.0)
+        if gap < 0.0 or gap > body_size * 1.25:
+            continue
+        current_indent = right_margin - float(current.get("x1") or 0.0)
+        previous_indent = right_margin - float(previous.get("x1") or 0.0)
+        following_indent = right_margin - float(following.get("x1") or 0.0)
+        if not (indent_threshold <= current_indent <= max_first_line_indent):
+            continue
+        if previous_indent > aligned_tolerance or following_indent > aligned_tolerance:
+            continue
+        if not sentence_end.search(previous_text):
+            continue
+        starts.add(index)
+    return starts
+
+
+def lines_to_blocks(lines: list[dict], body_size: float, page_width: float = 0.0) -> list[dict]:
     if not lines:
         return []
 
@@ -580,39 +642,143 @@ def lines_to_blocks(lines: list[dict], body_size: float) -> list[dict]:
     positive_gaps = [gap for gap in gaps if gap > 0]
     normal_gap = dominant_number(positive_gaps, fallback=body_size * 0.45)
     paragraph_gap = max(normal_gap * 1.85, body_size * 0.8)
+    rtl_indent_starts = rtl_indented_paragraph_starts(lines, body_size, page_width)
 
     blocks: list[dict] = []
     current: list[dict] = []
-    for line in lines:
+    current_start_reason = "page_start"
+    for index, line in enumerate(lines):
         if current:
             gap = line["top"] - current[-1]["bottom"]
-            starts_new = gap >= paragraph_gap
+            start_reason = "vertical_gap" if gap >= paragraph_gap else "rtl_first_line_indent" if index in rtl_indent_starts else ""
+            starts_new = bool(start_reason)
             if starts_new:
-                blocks.append({"lines": current})
+                blocks.append({"lines": current, "paragraph_start_reason": current_start_reason})
                 current = []
+                current_start_reason = start_reason
         current.append(line)
     if current:
-        blocks.append({"lines": current})
+        blocks.append({"lines": current, "paragraph_start_reason": current_start_reason})
 
     for block in blocks:
-        block["top"] = min(line["top"] for line in block["lines"])
-        block["bottom"] = max(line["bottom"] for line in block["lines"])
-        block["tag"] = "p"
-        block_text = " ".join(str(line.get("text") or "") for line in block["lines"])
-        repaired_block_text = repair_split_ltr_citation(block_text)
-        if repaired_block_text != block_text:
-            first_line = dict(block["lines"][0])
-            first_line["text"] = repaired_block_text
-            first_line["style_words"] = []
-            block["lines"] = [first_line]
-            block["html"] = wrap_span(repaired_block_text, [], "")
-        else:
-            block["html"] = " ".join(styled_line_html(line, body_size) for line in block["lines"])
+        render_body_block(block, body_size)
     return blocks
+
+
+def render_body_block(block: dict, body_size: float) -> dict:
+    block["top"] = min(line["top"] for line in block["lines"])
+    block["bottom"] = max(line["bottom"] for line in block["lines"])
+    block["tag"] = "p"
+    block_text = " ".join(str(line.get("text") or "") for line in block["lines"])
+    repaired_block_text = repair_split_ltr_citation(block_text)
+    if repaired_block_text != block_text:
+        first_line = dict(block["lines"][0])
+        first_line["text"] = repaired_block_text
+        first_line["style_words"] = []
+        block["lines"] = [first_line]
+        block["html"] = wrap_span(repaired_block_text, [], "")
+    else:
+        block["html"] = " ".join(styled_line_html(line, body_size) for line in block["lines"])
+    return block
+
+
+def block_is_heading_like(block: dict, page_width: float, body_size: float) -> bool:
+    lines = block.get("lines", [])
+    if not lines or len(lines) > 2 or page_width <= 0:
+        return False
+
+    text = block_plain_text(block).strip()
+    if not text or len(text) > 150 or re.search(r"[.!?؟׃:;״”'\)]\s*$", text):
+        return False
+
+    x0, _, x1, _ = block_bounds(block, page_width)
+    width_ratio = (x1 - x0) / page_width
+    center_ratio = ((x0 + x1) / 2.0) / page_width
+    sizes = [float(line.get("size") or body_size) for line in lines]
+    avg_size = sum(sizes) / len(sizes)
+    visually_heading = avg_size >= body_size * 1.04 or width_ratio <= 0.72
+    centered = 0.34 <= center_ratio <= 0.66
+    return visually_heading and centered
+
+
+def body_block_merge_reason(previous: dict, current: dict, page_width: float, body_size: float) -> str | None:
+    if previous.get("class") or current.get("class") or page_width <= 0:
+        return None
+    if current.get("paragraph_start_reason") in {"vertical_gap", "rtl_first_line_indent"}:
+        return None
+    if block_is_heading_like(previous, page_width, body_size) or block_is_heading_like(current, page_width, body_size):
+        return None
+
+    previous_x0, _, previous_x1, previous_bottom = block_bounds(previous, page_width)
+    current_x0, current_top, current_x1, _ = block_bounds(current, page_width)
+    gap = current_top - previous_bottom
+    if gap < 0 or gap > body_size * 3.2:
+        return None
+
+    previous_width = max(1.0, previous_x1 - previous_x0)
+    current_width = max(1.0, current_x1 - current_x0)
+    overlap = max(0.0, min(previous_x1, current_x1) - max(previous_x0, current_x0))
+    overlap_ratio = overlap / min(previous_width, current_width)
+    previous_zone = horizontal_zone(previous_x0, previous_x1, page_width)
+    current_zone = horizontal_zone(current_x0, current_x1, page_width)
+    same_region = previous_zone == current_zone or overlap_ratio >= 0.58
+    if not same_region:
+        return None
+
+    previous_text = block_plain_text(previous).strip()
+    current_text = block_plain_text(current).strip()
+    if not previous_text or not current_text:
+        return None
+
+    current_line_count = len(current.get("lines", []))
+    current_is_short_continuation = current_line_count <= 2 and len(current_text) <= 180
+    previous_continues = not re.search(r"[.!?؟׃:;״”'\)]\s*$", previous_text)
+    small_gap = gap <= body_size * 1.7
+    if previous_continues and gap <= body_size * 3.2:
+        return "continuing_sentence"
+    if small_gap and (overlap_ratio >= 0.72 or current_is_short_continuation):
+        return "same_region_small_gap"
+    return None
+
+
+def merge_adjacent_body_blocks(blocks: list[dict], page_width: float, body_size: float) -> list[dict]:
+    merged: list[dict] = []
+    for block in blocks:
+        if not merged:
+            merged.append(block)
+            continue
+
+        reason = body_block_merge_reason(merged[-1], block, page_width, body_size)
+        if not reason:
+            merged.append(block)
+            continue
+
+        previous = merged[-1]
+        merge_reasons = list(previous.get("merge_reasons", []))
+        merge_reasons.append(reason)
+        previous["lines"] = previous.get("lines", []) + block.get("lines", [])
+        previous["merge_reasons"] = merge_reasons
+        previous["merged_block_count"] = int(previous.get("merged_block_count", 1)) + int(block.get("merged_block_count", 1))
+        render_body_block(previous, body_size)
+
+    return merged
 
 
 def line_width(line: dict) -> float:
     return max(0.0, float(line.get("x1") or 0.0) - float(line.get("x0") or 0.0))
+
+
+def is_ltr_reference_fragment(text: str) -> bool:
+    normalized = normalize_text_spacing(text)
+    if not normalized or has_hebrew(normalized):
+        return False
+    if not re.search(r"\b(?:19|20)\d{2}\b", normalized):
+        return False
+    latin_chars = len(re.findall(r"[A-Za-z]", normalized))
+    if latin_chars < 4:
+        return False
+    reference_markers = sum(marker in normalized for marker in ("&", " et al", ",", ";", "("))
+    return reference_markers >= 2
 
 
 def estimate_body_band(lines: list[dict], body_size: float, page_width: float) -> tuple[float, float]:
@@ -652,6 +818,8 @@ def is_likely_secondary_line(line: dict, body_size: float, page_width: float, bo
     looks_like_heading = size >= body_size * 1.06 or is_bold_font(str(line.get("font") or ""))
 
     if looks_like_heading:
+        return False
+    if not outside_body and is_ltr_reference_fragment(text):
         return False
 
     score = 0
@@ -945,6 +1113,657 @@ def table_region_record(table: dict, page_width: float, order: int) -> dict:
     }
 
 
+def box_overlap_ratio(box: tuple[float, float, float, float], other: tuple[float, float, float, float], axis: str) -> float:
+    if axis == "x":
+        start = max(box[0], other[0])
+        end = min(box[2], other[2])
+        span = min(max(1.0, box[2] - box[0]), max(1.0, other[2] - other[0]))
+    else:
+        start = max(box[1], other[1])
+        end = min(box[3], other[3])
+        span = min(max(1.0, box[3] - box[1]), max(1.0, other[3] - other[1]))
+    return max(0.0, end - start) / span
+
+
+def box_edge_distance(box: tuple[float, float, float, float], other: tuple[float, float, float, float]) -> float:
+    dx = max(other[0] - box[2], box[0] - other[2], 0.0)
+    dy = max(other[1] - box[3], box[1] - other[3], 0.0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def content_image_records(
+    images: list[dict],
+    page_width: float,
+    page_height: float,
+    crop_bounds: tuple[float, float, float, float] | None = None,
+) -> list[dict]:
+    records: list[dict] = []
+    page_area = max(1.0, page_width * page_height)
+    crop_left = float(crop_bounds[0]) if crop_bounds else 0.0
+    layout_width = layout_width_for_bounds(page_width, crop_bounds)
+    for raw_index, image in enumerate(images, start=1):
+        x0 = float(image.get("x0") or 0.0)
+        x1 = float(image.get("x1") or 0.0)
+        top = float(image.get("top") or 0.0)
+        bottom = float(image.get("bottom") or 0.0)
+        if crop_bounds is not None and not bbox_midpoint_in_bounds(x0, top, x1, bottom, crop_bounds):
+            continue
+        width = max(0.0, x1 - x0)
+        height = max(0.0, bottom - top)
+        area = width * height
+        if area < 8000 or area >= page_area * 0.70:
+            continue
+        layout_x0 = x0 - crop_left
+        layout_x1 = x1 - crop_left
+        records.append(
+            {
+                "id": f"image-{len(records) + 1}",
+                "source_index": raw_index,
+                "kind": "image",
+                "source_box": [round(x0, 2), round(top, 2), round(x1, 2), round(bottom, 2)],
+                "top": round(top, 2),
+                "bottom": round(bottom, 2),
+                "x0": round(layout_x0, 2),
+                "x1": round(layout_x1, 2),
+                "width": round(width, 2),
+                "height": round(height, 2),
+                "zone": horizontal_zone(layout_x0, layout_x1, layout_width),
+            }
+        )
+    return records
+
+
+def image_box(image: dict) -> tuple[float, float, float, float]:
+    return (
+        float(image.get("x0") or 0.0),
+        float(image.get("top") or 0.0),
+        float(image.get("x1") or 0.0),
+        float(image.get("bottom") or 0.0),
+    )
+
+
+def caption_candidate_records(secondary_blocks: list[dict], page_width: float) -> list[dict]:
+    candidates: list[dict] = []
+    for index, block in enumerate(secondary_blocks, start=1):
+        x0, top, x1, bottom = block_bounds(block, page_width)
+        text = block_plain_text(block)
+        caption_id = f"caption-{index}"
+        caption_type = classify_caption_candidate(text, len(block.get("lines", [])), x0, x1, page_width)
+        block["id"] = caption_id
+        block["caption_type"] = caption_type
+        candidates.append(
+            {
+                "id": caption_id,
+                "box": (x0, top, x1, bottom),
+                "text": text,
+                "line_count": len(block.get("lines", [])),
+                "zone": horizontal_zone(x0, x1, page_width),
+                "caption_type": caption_type,
+            }
+        )
+    return candidates
+
+
+def caption_starts_like_figure(text: str) -> bool:
+    stripped = normalize_text_spacing(text)
+    return bool(re.match(r"^(תרשים|איור|טבלה)\s+\d", stripped))
+
+
+def classify_caption_candidate(text: str, line_count: int, x0: float, x1: float, page_width: float) -> str:
+    normalized = normalize_text_spacing(text)
+    text_length = len(normalized)
+    width_ratio = max(0.0, x1 - x0) / max(1.0, page_width)
+    if caption_starts_like_figure(normalized):
+        return "figure_title" if line_count <= 1 and text_length <= 55 else "full_caption"
+    if width_ratio <= 0.28 and line_count >= 3:
+        return "sidebar"
+    if line_count <= 2 and text_length <= 55:
+        return "local_label"
+    if line_count >= 3 or text_length >= 90:
+        return "full_caption"
+    return "unknown"
+
+
+def score_image_caption_match(image: dict, caption: dict, page_width: float) -> dict:
+    image_bounds = image_box(image)
+    caption_bounds = caption["box"]
+    x_overlap = box_overlap_ratio(image_bounds, caption_bounds, "x")
+    y_overlap = box_overlap_ratio(image_bounds, caption_bounds, "y")
+    distance = box_edge_distance(image_bounds, caption_bounds)
+    max_near = max(24.0, page_width * 0.18)
+    closeness = max(0.0, 1.0 - min(distance, max_near) / max_near)
+    caption_width = max(1.0, caption_bounds[2] - caption_bounds[0])
+    image_width = max(1.0, image_bounds[2] - image_bounds[0])
+    figure_marker = caption_starts_like_figure(caption.get("text", ""))
+    source_caption_type = str(caption.get("caption_type") or "unknown")
+    caption_type = source_caption_type
+    caption_side = ""
+    geometry_confirmed = False
+    edge_tolerance = max(12.0, page_width * 0.025)
+    edge_aligned = min(
+        abs(caption_bounds[0] - image_bounds[0]),
+        abs(caption_bounds[2] - image_bounds[2]),
+    ) <= edge_tolerance
+
+    if caption_bounds[1] >= image_bounds[3] and x_overlap >= 0.18:
+        reason = "below_overlap"
+        geometry_confirmed = x_overlap >= 0.55 and distance <= max(32.0, page_width * 0.08)
+        confidence = 0.58 + 0.25 * x_overlap + 0.17 * closeness
+    elif caption_bounds[3] <= image_bounds[1] and x_overlap >= 0.18:
+        reason = "above_overlap"
+        narrow_edge_caption = (
+            source_caption_type == "sidebar"
+            and int(caption.get("line_count") or 0) >= 3
+            and edge_aligned
+        )
+        geometry_confirmed = (
+            x_overlap >= 0.55
+            and distance <= max(24.0, page_width * 0.05)
+            and (caption_width >= image_width * 0.45 or figure_marker or narrow_edge_caption)
+        )
+        width_penalty = 0.30 if caption_width < image_width * 0.45 and not figure_marker and not geometry_confirmed else 0.0
+        confidence = 0.36 + 0.20 * x_overlap + 0.14 * closeness - width_penalty
+    elif y_overlap >= 0.14 and distance <= max(page_width * 0.28, 36.0):
+        reason = "side_overlap"
+        caption_side = "left" if (caption_bounds[0] + caption_bounds[2]) < (image_bounds[0] + image_bounds[2]) else "right"
+        geometry_confirmed = y_overlap >= 0.65 and distance <= max(28.0, page_width * 0.08)
+        confidence = 0.52 + 0.25 * y_overlap + 0.15 * closeness
+    elif figure_marker and distance <= page_width * 0.40:
+        reason = "group_caption"
+        confidence = 0.50 + 0.20 * closeness
+    else:
+        reason = "low_confidence_nearest"
+        confidence = 0.20 + 0.25 * closeness + 0.10 * max(x_overlap, y_overlap)
+
+    if source_caption_type == "sidebar" and geometry_confirmed:
+        caption_type = "full_caption"
+
+    confidence += {
+        "full_caption": 0.10,
+        "figure_title": 0.08,
+        "local_label": 0.0,
+        "unknown": 0.0,
+        "sidebar": -0.28,
+    }.get(caption_type, 0.0)
+    confidence = max(0.0, min(0.99, confidence))
+    if confidence < 0.45:
+        reason = f"low_confidence_{reason}"
+    return {
+        "caption_id": caption["id"],
+        "caption_text": caption.get("text", ""),
+        "caption_type": caption_type,
+        "source_caption_type": source_caption_type,
+        "distance": round(distance, 2),
+        "x_overlap": round(x_overlap, 2),
+        "y_overlap": round(y_overlap, 2),
+        "match_confidence": round(confidence, 2),
+        "match_reason": reason,
+        "caption_side": caption_side,
+        "geometry_confirmed": geometry_confirmed,
+        "edge_aligned": edge_aligned,
+    }
+
+
+def attach_image_caption_matches(images: list[dict], caption_candidates: list[dict], page_width: float) -> None:
+    ambiguous_candidates = len(caption_candidates) >= 6
+    for image in images:
+        if ambiguous_candidates:
+            image["ambiguous_caption_candidates"] = True
+        if not caption_candidates:
+            image["caption_match"] = None
+            image["match_confidence"] = 0.0
+            image["match_reason"] = "no_caption_candidates"
+            continue
+        matches = [score_image_caption_match(image, caption, page_width) for caption in caption_candidates]
+        best = max(matches, key=lambda item: (item["match_confidence"], -item["distance"]))
+        if ambiguous_candidates and best["match_confidence"] >= 0.75 and not caption_starts_like_figure(best.get("caption_text", "")):
+            best = dict(best)
+            best["match_confidence"] = round(max(0.0, best["match_confidence"] - 0.18), 2)
+            best["match_reason"] = f"ambiguous_{best['match_reason']}"
+        image["caption_match"] = best
+        image["nearest_caption_id"] = best["caption_id"]
+        image["match_confidence"] = best["match_confidence"]
+        image["match_reason"] = best["match_reason"]
+
+
+def recover_image_caption_continuations(
+    images: list[dict],
+    caption_candidates: list[dict],
+    body_blocks: list[dict],
+    secondary_blocks: list[dict],
+    page_width: float,
+    page_height: float,
+) -> None:
+    """Promote geometry-confirmed captions and join tiny trailing fragments."""
+    for index, block in enumerate(body_blocks, start=1):
+        block.setdefault("id", f"body-block-{index}")
+    secondary_by_id: dict[str, dict] = {}
+    for index, block in enumerate(secondary_blocks, start=1):
+        block.setdefault("id", f"caption-{index}")
+        secondary_by_id[str(block["id"])] = block
+    candidate_by_id = {str(candidate.get("id") or ""): candidate for candidate in caption_candidates}
+
+    for image in images:
+        match = image.get("caption_match") or {}
+        caption_id = str(match.get("caption_id") or "")
+        caption_block = secondary_by_id.get(caption_id)
+        match_reason = str(match.get("match_reason") or "")
+        if (
+            not caption_block
+            or str(match.get("caption_type") or "") not in {"full_caption", "figure_title"}
+            or float(match.get("match_confidence") or 0.0) < IMAGE_CAPTION_CONFIDENCE_THRESHOLD
+            or not bool(match.get("geometry_confirmed"))
+            or not any(location in match_reason for location in ("side_overlap", "below_overlap", "above_overlap"))
+        ):
+            continue
+
+        caption_block["caption_type"] = "full_caption"
+        candidate = candidate_by_id.get(caption_id)
+        if candidate is not None:
+            candidate["caption_type"] = "full_caption"
+        image["caption_complete"] = True
+        image["caption_source_blocks"] = [caption_id]
+        image["caption_merge_reason"] = "geometry_confirmed_caption"
+        caption_bounds = block_bounds(caption_block, page_width)
+        current_bottom = caption_bounds[3]
+        caption_parts = [block_plain_text(caption_block)]
+        source_blocks = [caption_id]
+        max_gap = max(12.0, page_height * 0.02)
+        for block in sorted(body_blocks, key=lambda item: float(item.get("top") or 0.0)):
+            if block.get("consumed_by_figure_group") or block.get("consumed_by_image"):
+                continue
+            bounds = block_bounds(block, page_width)
+            gap = bounds[1] - current_bottom
+            text = block_plain_text(block)
+            if gap < -2.0 or gap > max_gap:
+                continue
+            if box_overlap_ratio(caption_bounds, bounds, "x") < 0.65:
+                continue
+            if len(block.get("lines", [])) > 2 or len(text) > 80 or not text:
+                continue
+            if caption_parts[-1].rstrip().endswith((".", "!", "?", ":", ";")):
+                break
+            caption_parts.append(text)
+            source_blocks.append(str(block.get("id") or ""))
+            block["consumed_by_image"] = str(image.get("id") or "")
+            caption_block.setdefault("lines", []).extend(block.get("lines", []))
+            caption_block["bottom"] = max(float(caption_block.get("bottom") or 0.0), bounds[3])
+            current_bottom = bounds[3]
+
+        if len(caption_parts) == 1:
+            continue
+        recovered_text = normalize_text_spacing(" ".join(caption_parts))
+        location = next(location for location in ("side_overlap", "below_overlap", "above_overlap") if location in match_reason)
+        prefix = "ambiguous_" if match_reason.startswith("ambiguous_") else ""
+        recovered_reason = f"{prefix}{location}_with_continuation"
+        match["caption_text"] = recovered_text
+        match["match_reason"] = recovered_reason
+        image["caption_match"] = match
+        image["match_reason"] = recovered_reason
+        image["caption_complete"] = True
+        image["caption_source_blocks"] = source_blocks
+        image["caption_merge_reason"] = "geometry_confirmed_caption_with_adjacent_body_fragment"
+        if candidate is not None:
+            candidate["text"] = recovered_text
+
+
+def image_regions_are_neighbors(first: dict, second: dict, page_width: float, page_height: float) -> bool:
+    first_box = image_box(first)
+    second_box = image_box(second)
+    x_overlap = box_overlap_ratio(first_box, second_box, "x")
+    y_overlap = box_overlap_ratio(first_box, second_box, "y")
+    horizontal_gap = max(0.0, max(first_box[0], second_box[0]) - min(first_box[2], second_box[2]))
+    vertical_gap = max(0.0, max(first_box[1], second_box[1]) - min(first_box[3], second_box[3]))
+    horizontal_neighbors = y_overlap >= 0.55 and horizontal_gap <= max(18.0, page_width * 0.035)
+    vertical_neighbors = x_overlap >= 0.55 and vertical_gap <= max(24.0, page_height * 0.06)
+    return horizontal_neighbors or vertical_neighbors
+
+
+def figure_group_record(
+    group_index: int,
+    members: list[dict],
+    caption_candidates: list[dict],
+    page_width: float,
+    grouping_reason: str,
+) -> dict:
+    x0 = min(image_box(image)[0] for image in members)
+    top = min(image_box(image)[1] for image in members)
+    x1 = max(image_box(image)[2] for image in members)
+    bottom = max(image_box(image)[3] for image in members)
+    source_boxes = [image.get("source_box") for image in members if image.get("source_box")]
+    source_box = [
+        round(min(float(box[0]) for box in source_boxes), 2),
+        round(min(float(box[1]) for box in source_boxes), 2),
+        round(max(float(box[2]) for box in source_boxes), 2),
+        round(max(float(box[3]) for box in source_boxes), 2),
+    ] if source_boxes else [round(x0, 2), round(top, 2), round(x1, 2), round(bottom, 2)]
+    group: dict = {
+        "id": f"figure-group-{group_index}",
+        "kind": "figure_group",
+        "source_box": source_box,
+        "top": round(top, 2),
+        "bottom": round(bottom, 2),
+        "x0": round(x0, 2),
+        "x1": round(x1, 2),
+        "width": round(x1 - x0, 2),
+        "height": round(bottom - top, 2),
+        "zone": horizontal_zone(x0, x1, page_width),
+        "member_image_ids": [str(image.get("id") or "") for image in members],
+        "member_source_indexes": [int(image.get("source_index") or 0) for image in members],
+        "member_count": len(members),
+        "grouping_reason": grouping_reason,
+    }
+
+    # A shared caption normally sits outside the complete gallery bounds. Local labels
+    # between individual panels are intentionally excluded from this group-level pass.
+    member_caption_counts: dict[str, int] = {}
+    for image in members:
+        caption_id = str(image.get("nearest_caption_id") or "")
+        if caption_id:
+            member_caption_counts[caption_id] = member_caption_counts.get(caption_id, 0) + 1
+    outside_candidates = [
+        caption
+        for caption in caption_candidates
+        if (
+            float(caption["box"][1]) >= bottom
+            or float(caption["box"][3]) <= top
+            or float(caption["box"][0]) >= x1
+            or float(caption["box"][2]) <= x0
+        )
+        and (
+            str(caption.get("id") or "") not in member_caption_counts
+            or member_caption_counts[str(caption.get("id") or "")] >= 2
+            or caption_starts_like_figure(str(caption.get("text") or ""))
+        )
+        and (
+            str(caption.get("caption_type") or "unknown") not in {"local_label", "sidebar"}
+            or member_caption_counts.get(str(caption.get("id") or ""), 0) >= 2
+        )
+    ]
+    if outside_candidates:
+        matches = [score_image_caption_match(group, caption, page_width) for caption in outside_candidates]
+        best = max(
+            matches,
+            key=lambda item: (
+                {"full_caption": 3, "figure_title": 2, "unknown": 1}.get(str(item.get("caption_type") or "unknown"), 0),
+                item["match_confidence"],
+                -item["distance"],
+            ),
+        )
+        group["caption_match"] = best
+        group["nearest_caption_id"] = best["caption_id"]
+        group["match_confidence"] = best["match_confidence"]
+        group["match_reason"] = f"group_{best['match_reason']}"
+    else:
+        group["caption_match"] = None
+        group["match_confidence"] = 0.0
+        group["match_reason"] = "no_group_caption_candidates"
+    group_caption_id = str((group.get("caption_match") or {}).get("caption_id") or "")
+    local_labels = [
+        {
+            "caption_id": str(caption.get("id") or ""),
+            "text": str(caption.get("text") or ""),
+            "box": [round(float(value), 2) for value in caption.get("box", ())],
+            "caption_type": str(caption.get("caption_type") or "local_label"),
+        }
+        for caption in sorted(caption_candidates, key=lambda item: (float(item["box"][1]), -float(item["box"][0])))
+        if str(caption.get("id") or "") != group_caption_id
+        and str(caption.get("caption_type") or "unknown") == "local_label"
+        and float(caption["box"][0]) <= x1 + 12.0
+        and float(caption["box"][2]) >= x0 - 12.0
+        and float(caption["box"][1]) <= bottom + 12.0
+        and float(caption["box"][3]) >= top - 12.0
+    ]
+    if local_labels:
+        group["local_labels"] = local_labels
+    return group
+
+
+def cluster_image_regions(
+    images: list[dict],
+    caption_candidates: list[dict],
+    page_width: float,
+    page_height: float,
+) -> list[dict]:
+    if len(images) < 2:
+        return []
+
+    adjacency: list[set[int]] = [set() for _ in images]
+    for first_index, first in enumerate(images):
+        for second_index in range(first_index + 1, len(images)):
+            if image_regions_are_neighbors(first, images[second_index], page_width, page_height):
+                adjacency[first_index].add(second_index)
+                adjacency[second_index].add(first_index)
+
+    components: list[list[dict]] = []
+    visited: set[int] = set()
+    for start in range(len(images)):
+        if start in visited:
+            continue
+        stack = [start]
+        indexes: list[int] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            indexes.append(current)
+            stack.extend(adjacency[current] - visited)
+        if len(indexes) >= 2:
+            components.append([images[index] for index in sorted(indexes)])
+
+    groups: list[dict] = []
+    for members in components:
+        caption_counts: dict[str, int] = {}
+        for image in members:
+            caption_id = str(image.get("nearest_caption_id") or "")
+            if caption_id:
+                caption_counts[caption_id] = caption_counts.get(caption_id, 0) + 1
+        shared_caption = max(caption_counts.values(), default=0) >= 2
+        ambiguous = any(image.get("ambiguous_caption_candidates") for image in members)
+        dense_gallery = len(members) >= 4
+        independently_captioned = all(
+            float(image.get("match_confidence") or 0.0) >= 0.85
+            and not image.get("ambiguous_caption_candidates")
+            for image in members
+        ) and len({str(image.get("nearest_caption_id") or "") for image in members}) == len(members)
+        if independently_captioned or not (shared_caption or ambiguous or dense_gallery):
+            continue
+        grouping_reason = "shared_caption" if shared_caption else "dense_gallery" if dense_gallery else "ambiguous_nearby_images"
+        group = figure_group_record(len(groups) + 1, members, caption_candidates, page_width, grouping_reason)
+        groups.append(group)
+        for image in members:
+            image["group_candidate"] = True
+            image["figure_group_id"] = group["id"]
+    return groups
+
+
+def recover_figure_group_captions(
+    figure_groups: list[dict],
+    body_blocks: list[dict],
+    secondary_blocks: list[dict],
+    page_width: float,
+    page_height: float,
+) -> None:
+    for index, block in enumerate(body_blocks, start=1):
+        block.setdefault("id", f"body-block-{index}")
+    for index, block in enumerate(secondary_blocks, start=1):
+        block.setdefault("id", f"caption-{index}")
+
+    for group in figure_groups:
+        existing_match = group.get("caption_match") or {}
+        if (
+            str(existing_match.get("caption_type") or "") in {"full_caption", "figure_title"}
+            and float(group.get("match_confidence") or 0.0) >= IMAGE_CAPTION_CONFIDENCE_THRESHOLD
+        ):
+            group["caption_complete"] = True
+            group["caption_source_blocks"] = [str(existing_match.get("caption_id") or "")]
+            group["caption_merge_reason"] = "direct_full_caption_match"
+            continue
+
+        group_bounds = image_box(group)
+        max_distance = max(42.0, min(page_width * 0.22, page_height * 0.14))
+        anchors: list[tuple[float, dict, tuple[float, float, float, float]]] = []
+        for block in body_blocks:
+            if block.get("consumed_by_figure_group"):
+                continue
+            text = block_plain_text(block)
+            if not caption_starts_like_figure(text):
+                continue
+            bounds = block_bounds(block, page_width)
+            distance = box_edge_distance(group_bounds, bounds)
+            x_overlap = box_overlap_ratio(group_bounds, bounds, "x")
+            y_overlap = box_overlap_ratio(group_bounds, bounds, "y")
+            if distance <= max_distance and max(x_overlap, y_overlap) >= 0.18:
+                anchors.append((distance, block, bounds))
+        if not anchors:
+            group["caption_complete"] = False
+            continue
+
+        _, anchor, anchor_bounds = min(anchors, key=lambda item: (item[0], float(item[2][1])))
+        source_blocks = [str(anchor.get("id") or "")]
+        caption_parts = [block_plain_text(anchor)]
+        last_bottom = anchor_bounds[3]
+        continuation_gap = max(16.0, page_height * 0.025)
+        for block in sorted(secondary_blocks, key=lambda item: float(item.get("top") or 0.0)):
+            if block.get("consumed_by_figure_group"):
+                continue
+            bounds = block_bounds(block, page_width)
+            gap = bounds[1] - last_bottom
+            if gap < -2.0 or gap > continuation_gap:
+                continue
+            if box_overlap_ratio(anchor_bounds, bounds, "x") < 0.18:
+                continue
+            text = block_plain_text(block)
+            if not text or caption_starts_like_figure(text) or str(block.get("caption_type") or "") == "sidebar":
+                continue
+            caption_parts.append(text)
+            source_blocks.append(str(block.get("id") or ""))
+            block["consumed_by_figure_group"] = str(group.get("id") or "")
+            last_bottom = bounds[3]
+
+        recovered_text = normalize_text_spacing(" ".join(caption_parts))
+        recovered_id = f"recovered-{group.get('id', 'figure-group')}-caption"
+        anchor["consumed_by_figure_group"] = str(group.get("id") or "")
+        anchor["caption_type"] = "full_caption"
+        group["caption_match"] = {
+            "caption_id": recovered_id,
+            "caption_text": recovered_text,
+            "caption_type": "full_caption",
+            "distance": round(box_edge_distance(group_bounds, anchor_bounds), 2),
+            "x_overlap": round(box_overlap_ratio(group_bounds, anchor_bounds, "x"), 2),
+            "y_overlap": round(box_overlap_ratio(group_bounds, anchor_bounds, "y"), 2),
+            "match_confidence": 0.96,
+            "match_reason": "recovered_body_caption",
+        }
+        group["nearest_caption_id"] = recovered_id
+        group["match_confidence"] = 0.96
+        group["match_reason"] = "recovered_body_caption"
+        group["caption_source_blocks"] = source_blocks
+        group["caption_complete"] = True
+        group["caption_merge_reason"] = "figure_marker_body_block_with_adjacent_continuation"
+
+
+def render_pdf_page_to_png(pdf_path: Path, page_number: int, output_dir: Path, dpi: int = IMAGE_RENDER_DPI) -> Path:
+    if not PDFTOPPM.exists():
+        raise FileNotFoundError(f"pdftoppm was not found: {PDFTOPPM}")
+    prefix = output_dir / f"page-{page_number}"
+    result = subprocess.run(
+        [
+            str(PDFTOPPM),
+            "-f",
+            str(page_number),
+            "-l",
+            str(page_number),
+            "-singlefile",
+            "-png",
+            "-r",
+            str(dpi),
+            str(pdf_path),
+            str(prefix),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "pdftoppm failed")
+    return prefix.with_suffix(".png")
+
+
+def validate_image_quality(value: int) -> int:
+    quality = int(value)
+    if not 35 <= quality <= 95:
+        raise ValueError("Image quality must be between 35 and 95")
+    return quality
+
+
+def validate_image_max_width(value: int) -> int:
+    width = int(value)
+    if not 240 <= width <= 2000:
+        raise ValueError("Image maximum width must be between 240 and 2000 pixels")
+    return width
+
+
+def image_crop_data_uri(
+    rendered_page_path: Path,
+    page_width: float,
+    page_height: float,
+    source_box: list[float],
+    *,
+    quality: int = IMAGE_JPEG_QUALITY,
+    max_width: int = IMAGE_MAX_EMBED_WIDTH,
+) -> str:
+    with Image.open(rendered_page_path) as rendered:
+        scale_x = rendered.width / max(1.0, page_width)
+        scale_y = rendered.height / max(1.0, page_height)
+        x0, top, x1, bottom = [float(value) for value in source_box]
+        left = max(0, min(rendered.width, int(x0 * scale_x)))
+        upper = max(0, min(rendered.height, int(top * scale_y)))
+        right = max(left + 1, min(rendered.width, int(x1 * scale_x)))
+        lower = max(upper + 1, min(rendered.height, int(bottom * scale_y)))
+        crop = rendered.crop((left, upper, right, lower)).convert("RGB")
+        if crop.width > max_width:
+            ratio = max_width / crop.width
+            crop = crop.resize((max_width, max(1, int(crop.height * ratio))), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        crop.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def embed_page_images(
+    pdf_path: Path,
+    pages: list[dict],
+    *,
+    quality: int = IMAGE_JPEG_QUALITY,
+    max_width: int = IMAGE_MAX_EMBED_WIDTH,
+    progress_callback=None,
+) -> None:
+    quality = validate_image_quality(quality)
+    max_width = validate_image_max_width(max_width)
+    pages_with_images = [page for page in pages if page.get("image_regions")]
+    if not pages_with_images:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        for page_index, page in enumerate(pages_with_images, start=1):
+            if progress_callback:
+                progress_callback(f"Rendering images for page {page['number']} ({page_index}/{len(pages_with_images)})")
+            rendered_page = render_pdf_page_to_png(pdf_path, int(page["number"]), tmp_path)
+            for image in page.get("image_regions", []):
+                source_box = image.get("source_box")
+                if not source_box:
+                    continue
+                image["src"] = image_crop_data_uri(
+                    rendered_page,
+                    float(page.get("source_width") or page.get("width") or 1.0),
+                    float(page.get("source_height") or page.get("height") or 1.0),
+                    source_box,
+                    quality=quality,
+                    max_width=max_width,
+                )
+
+
 def layout_item_bounds(item: dict, kind: str, page_width: float) -> tuple[float, float, float, float]:
     if kind == "table":
         return (
@@ -953,6 +1772,8 @@ def layout_item_bounds(item: dict, kind: str, page_width: float) -> tuple[float,
             float(item.get("x1") or page_width),
             float(item.get("bottom") or item.get("top") or 0.0),
         )
+    if kind in {"image", "figure_group"}:
+        return image_box(item)
     return block_bounds(item, page_width)
 
 
@@ -975,7 +1796,7 @@ def sort_layout_items(items: list[tuple[str, dict]], page_width: float, body_siz
             groups[-1].append(entry)
 
     zone_rank = {"right": 0, "full": 1, "center": 1, "unknown": 1, "left": 2}
-    kind_rank = {"body": 0, "question": 1, "caption": 2, "table": 3}
+    kind_rank = {"body": 0, "question": 1, "caption": 2, "figure_group": 3, "image": 3, "table": 4}
     result: list[tuple[str, dict]] = []
     for group in groups:
         if len(group) == 1:
@@ -992,16 +1813,30 @@ def sort_layout_items(items: list[tuple[str, dict]], page_width: float, body_siz
     return result
 
 
-def build_layout_regions(body_blocks: list[dict], secondary_blocks: list[dict], tables: list[dict], page_width: float) -> list[dict]:
+def build_layout_regions(body_blocks: list[dict], secondary_blocks: list[dict], tables: list[dict], page_width: float, image_regions: list[dict] | None = None, figure_groups: list[dict] | None = None) -> list[dict]:
     items: list[tuple[str, dict]] = []
     for block in body_blocks:
+        if block.get("consumed_by_figure_group") or block.get("consumed_by_image"):
+            continue
         kind = "question" if block.get("class") == "question-box" else "body"
         items.append((kind, block))
     for block in secondary_blocks:
+        if block.get("consumed_by_figure_group") or block.get("consumed_by_image"):
+            continue
         items.append(("caption", block))
     for table in tables:
         if table.get("reconstructed") or (table.get("data") and table.get("cols", 0) > 1):
             items.append(("table", table))
+    grouped_image_ids = {
+        str(image_id)
+        for group in figure_groups or []
+        for image_id in group.get("member_image_ids", [])
+    }
+    for image in image_regions or []:
+        if str(image.get("id") or "") not in grouped_image_ids:
+            items.append(("image", image))
+    for group in figure_groups or []:
+        items.append(("figure_group", group))
 
     regions: list[dict] = []
     body_size = dominant_number(
@@ -1016,6 +1851,10 @@ def build_layout_regions(body_blocks: list[dict], secondary_blocks: list[dict], 
     for order, (kind, item) in enumerate(sort_layout_items(items, page_width, body_size), start=1):
         if kind == "table":
             regions.append(table_region_record(item, page_width, order))
+        elif kind in {"image", "figure_group"}:
+            record = dict(item)
+            record["order"] = order
+            regions.append(record)
         else:
             regions.append(layout_region_record(f"{kind}-{order}", kind, item, page_width, order))
     return regions
@@ -1343,16 +2182,18 @@ def extract_pdf_structured(
     pdf_path: Path,
     crop_settings: dict | None = None,
     page_numbers: set[int] | None = None,
+    *,
+    embed_images: bool = True,
+    image_quality: int = IMAGE_JPEG_QUALITY,
+    image_max_width: int = IMAGE_MAX_EMBED_WIDTH,
+    progress_callback=None,
 ) -> tuple[list[dict], str, int, int]:
     pages: list[dict] = []
     all_lines: list[dict] = []
     crop_settings = normalize_crop_settings(crop_settings)
     crop_enabled = crop_settings_enabled(crop_settings)
     pypdf_reader = PdfReader(str(pdf_path))
-    text_pages = [
-        [line.strip() for line in (page.extract_text() or "").splitlines() if line.strip()]
-        for page in pypdf_reader.pages
-    ]
+    text_pages = extract_requested_text_pages(pypdf_reader, page_numbers)
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
@@ -1368,8 +2209,9 @@ def extract_pdf_structured(
             layout_width = layout_width_for_bounds(float(page.width), crop_bounds)
             layout_words = normalize_words_to_layout_bounds(words, crop_bounds)
             lines = cluster_visual_lines(layout_words, layout_width)
+            image_regions = content_image_records(page.images, float(page.width), float(page.height), crop_bounds)
             tables = detect_tables(page, crop_bounds)
-            correct_text_lines = text_pages[page_number - 1] if page_number <= len(text_pages) else []
+            correct_text_lines = text_pages.get(page_number, [])
             if crop_enabled:
                 corrected_lines = align_text_lines_to_style_lines(correct_text_lines, lines, require_visual_match=True) if correct_text_lines else visual_lines_to_text_lines(lines)
             else:
@@ -1383,7 +2225,19 @@ def extract_pdf_structured(
                     fallback_lines=table_order_lines,
                 )
             )
-            pages.append({"number": page_number, "width": layout_width, "height": float(page.height), "lines": corrected_lines, "visual_lines": lines, "tables": tables})
+            pages.append(
+                {
+                    "number": page_number,
+                    "width": layout_width,
+                    "height": float(page.height),
+                    "source_width": float(page.width),
+                    "source_height": float(page.height),
+                    "lines": corrected_lines,
+                    "visual_lines": lines,
+                    "tables": tables,
+                    "image_regions": image_regions,
+                }
+            )
             all_lines.extend(corrected_lines)
 
     if page_numbers and not pages:
@@ -1401,18 +2255,53 @@ def extract_pdf_structured(
         content_lines, noise_lines = split_noise_lines(non_table_lines, float(page.get("width") or 0.0), float(page.get("height") or 0.0), body_size)
         flow_lines, secondary_blocks = separate_secondary_text(content_lines, body_size, float(page.get("width") or 0.0))
         flow_lines, question_blocks = extract_question_callouts(flow_lines, page.get("visual_lines", []), body_size)
-        page["blocks"] = lines_to_blocks(flow_lines, body_size)
+        page_width = float(page.get("width") or 0.0)
+        page["blocks"] = merge_adjacent_body_blocks(lines_to_blocks(flow_lines, body_size, page_width), page_width, body_size)
         page["blocks"].extend(question_blocks)
+        caption_candidates = caption_candidate_records(secondary_blocks, float(page.get("width") or 0.0))
+        attach_image_caption_matches(page.get("image_regions", []), caption_candidates, float(page.get("width") or 0.0))
+        recover_image_caption_continuations(
+            page.get("image_regions", []),
+            caption_candidates,
+            page["blocks"],
+            secondary_blocks,
+            float(page.get("width") or 0.0),
+            float(page.get("height") or 0.0),
+        )
+        page["figure_groups"] = cluster_image_regions(
+            page.get("image_regions", []),
+            caption_candidates,
+            float(page.get("width") or 0.0),
+            float(page.get("height") or 0.0),
+        )
+        recover_figure_group_captions(
+            page["figure_groups"],
+            page["blocks"],
+            secondary_blocks,
+            float(page.get("width") or 0.0),
+            float(page.get("height") or 0.0),
+        )
         assign_secondary_reading_order(page["blocks"], secondary_blocks, body_size)
         page["secondary_blocks"] = secondary_blocks
         page["noise_lines"] = noise_lines
-        page["regions"] = build_layout_regions(page["blocks"], secondary_blocks, page.get("tables", []), float(page.get("width") or 0.0))
+        page["regions"] = build_layout_regions(page["blocks"], secondary_blocks, page.get("tables", []), float(page.get("width") or 0.0), image_regions=page.get("image_regions", []), figure_groups=page.get("figure_groups", []))
+
+    if embed_images:
+        embed_page_images(
+            pdf_path,
+            pages,
+            quality=image_quality,
+            max_width=image_max_width,
+            progress_callback=progress_callback,
+        )
 
     plain_text_parts: list[str] = []
     for page in pages:
         plain_text_parts.append(f"--- עמוד {page['number']} ---")
         reading_items: list[tuple[str, dict]] = []
         for block in page["blocks"] + page.get("secondary_blocks", []):
+            if block.get("consumed_by_figure_group") or block.get("consumed_by_image"):
+                continue
             kind = "caption" if block.get("class") == "caption" else "question" if block.get("class") == "question-box" else "body"
             reading_items.append((kind, block))
         for table in page.get("tables", []):
@@ -1441,10 +2330,7 @@ def build_layout_debug_report(
     crop_settings = normalize_crop_settings(crop_settings)
     crop_enabled = crop_settings_enabled(crop_settings)
     pypdf_reader = PdfReader(str(pdf_path))
-    text_pages = [
-        [line.strip() for line in (page.extract_text() or "").splitlines() if line.strip()]
-        for page in pypdf_reader.pages
-    ]
+    text_pages = extract_requested_text_pages(pypdf_reader, page_numbers)
     report_pages: list[dict] = []
     all_corrected_lines: list[dict] = []
 
@@ -1462,7 +2348,8 @@ def build_layout_debug_report(
             layout_width = layout_width_for_bounds(float(page.width), crop_bounds)
             layout_words = normalize_words_to_layout_bounds(cropped_words, crop_bounds)
             visual_lines = cluster_visual_lines(layout_words, layout_width)
-            logical_lines = text_pages[page_number - 1] if page_number <= len(text_pages) else []
+            image_regions = content_image_records(page.images, float(page.width), float(page.height), crop_bounds)
+            logical_lines = text_pages.get(page_number, [])
             if crop_enabled:
                 corrected_lines = align_text_lines_to_style_lines(logical_lines, visual_lines, require_visual_match=True) if logical_lines else visual_lines_to_text_lines(visual_lines)
             else:
@@ -1521,6 +2408,7 @@ def build_layout_debug_report(
                     "_corrected_lines_for_classification": corrected_lines,
                     "_visual_lines_for_classification": visual_lines,
                     "_tables_for_classification": tables,
+                    "_image_regions_for_classification": image_regions,
                 }
             )
             all_corrected_lines.extend(corrected_lines)
@@ -1530,6 +2418,7 @@ def build_layout_debug_report(
         corrected_lines = page_report.pop("_corrected_lines_for_classification")
         visual_lines = page_report.pop("_visual_lines_for_classification")
         tables = page_report.pop("_tables_for_classification")
+        image_regions = page_report.pop("_image_regions_for_classification")
         non_table_lines = [line for line in corrected_lines if not line_overlaps_table(line, tables)]
         content_lines, noise_lines = split_noise_lines(
             non_table_lines,
@@ -1539,24 +2428,57 @@ def build_layout_debug_report(
         )
         flow_lines, secondary_blocks = separate_secondary_text(content_lines, body_size, float(page_report["layout_width"]))
         flow_lines, question_blocks = extract_question_callouts(flow_lines, visual_lines, body_size)
-        body_blocks = lines_to_blocks(flow_lines, body_size)
+        layout_width = float(page_report["layout_width"])
+        body_blocks = merge_adjacent_body_blocks(lines_to_blocks(flow_lines, body_size, layout_width), layout_width, body_size)
         body_blocks.extend(question_blocks)
         assign_secondary_reading_order(body_blocks, secondary_blocks, body_size)
+        caption_candidates = caption_candidate_records(secondary_blocks, float(page_report["layout_width"]))
+        attach_image_caption_matches(image_regions, caption_candidates, float(page_report["layout_width"]))
+        recover_image_caption_continuations(
+            image_regions,
+            caption_candidates,
+            body_blocks,
+            secondary_blocks,
+            float(page_report["layout_width"]),
+            float(page_report["page_height"]),
+        )
+        figure_groups = cluster_image_regions(
+            image_regions,
+            caption_candidates,
+            float(page_report["layout_width"]),
+            float(page_report["page_height"]),
+        )
+        recover_figure_group_captions(
+            figure_groups,
+            body_blocks,
+            secondary_blocks,
+            float(page_report["layout_width"]),
+            float(page_report["page_height"]),
+        )
         page_report["classification"] = {
             "body_lines": [line_debug_record(line, role="body") for line in flow_lines],
             "noise_lines": [line_debug_record(line, role="noise") for line in noise_lines],
             "caption_blocks": [
                 {
+                    "id": f"caption-{index}",
+                    "caption_type": str(block.get("caption_type") or "unknown"),
+                    "consumed_by_figure_group": block.get("consumed_by_figure_group"),
+                    "consumed_by_image": block.get("consumed_by_image"),
                     "top": round(float(block.get("top") or 0.0), 2),
                     "bottom": round(float(block.get("bottom") or 0.0), 2),
                     "reading_top": round(float(block.get("reading_top", block.get("top", 0.0))), 2),
                     "text": block_plain_text(block),
                     "lines": [line_debug_record(line, role="caption") for line in block.get("lines", [])],
                 }
-                for block in secondary_blocks
+                for index, block in enumerate(secondary_blocks, start=1)
             ],
+            "image_regions": image_regions,
+            "figure_groups": figure_groups,
             "question_blocks": [
                 {
+                    "id": str(block.get("id") or ""),
+                    "consumed_by_figure_group": block.get("consumed_by_figure_group"),
+                    "consumed_by_image": block.get("consumed_by_image"),
                     "top": round(float(block.get("top") or 0.0), 2),
                     "bottom": round(float(block.get("bottom") or 0.0), 2),
                     "text": block_plain_text(block),
@@ -1566,14 +2488,20 @@ def build_layout_debug_report(
             ],
             "body_blocks": [
                 {
+                    "id": str(block.get("id") or ""),
+                    "consumed_by_figure_group": block.get("consumed_by_figure_group"),
+                    "consumed_by_image": block.get("consumed_by_image"),
                     "top": round(float(block.get("top") or 0.0), 2),
                     "bottom": round(float(block.get("bottom") or 0.0), 2),
                     "ends_sentence": block_ends_sentence(block),
+                    "paragraph_start_reason": str(block.get("paragraph_start_reason") or ""),
+                    "merged_block_count": int(block.get("merged_block_count", 1)),
+                    "merge_reasons": block.get("merge_reasons", []),
                     "text": block_plain_text(block),
                 }
                 for block in body_blocks
             ],
-            "regions": build_layout_regions(body_blocks, secondary_blocks, tables, float(page_report["layout_width"])),
+            "regions": build_layout_regions(body_blocks, secondary_blocks, tables, float(page_report["layout_width"]), image_regions=image_regions, figure_groups=figure_groups),
         }
 
     return {
@@ -1598,14 +2526,163 @@ def write_layout_debug_report(
     return output_path
 
 
+def image_figure_html(image: dict, caption_text: str = "") -> str:
+    src = str(image.get("src") or "")
+    if not src:
+        return ""
+    confidence = float(image.get("match_confidence") or 0.0)
+    reason = str(image.get("match_reason") or "")
+    classes = ["embedded-image"]
+    match = image.get("caption_match") or {}
+    if caption_text and "side_overlap" in reason:
+        caption_side = str(match.get("caption_side") or "right")
+        classes.extend(["side-caption", f"side-caption-{caption_side}"])
+    elif caption_text and "above_overlap" in reason:
+        classes.append("caption-above")
+    elif caption_text and "below_overlap" in reason:
+        classes.append("caption-below")
+    if image.get("group_candidate"):
+        classes.append("image-group-candidate")
+    if image.get("ambiguous_caption_candidates"):
+        classes.append("ambiguous-caption")
+    img_alt = html.escape(caption_text or f"Image {image.get('id', '')}".strip())
+    caption_html = f"<figcaption>{text_with_bidi_isolates(caption_text)}</figcaption>" if caption_text else ""
+    return (
+        f'<figure class="{" ".join(classes)}" data-match-confidence="{confidence:.2f}" '
+        f'data-match-reason="{html.escape(reason)}">'
+        f'<img src="{html.escape(src)}" alt="{img_alt}" loading="lazy">'
+        f"{caption_html}</figure>"
+    )
+
+
+def usable_image_caption(item: dict) -> bool:
+    match = item.get("caption_match") or {}
+    caption_type = str(match.get("caption_type") or "unknown")
+    allowed_types = (
+        {"full_caption", "figure_title"}
+        if item.get("kind") == "figure_group"
+        else {"full_caption", "figure_title", "local_label", "unknown"}
+    )
+    return (
+        bool(match.get("caption_id"))
+        and caption_type in allowed_types
+        and float(item.get("match_confidence") or 0.0) >= IMAGE_CAPTION_CONFIDENCE_THRESHOLD
+        and not str(item.get("match_reason") or "").startswith("low_confidence")
+    )
+
+
+def figure_group_layout_class(group: dict, members: list[dict]) -> str:
+    if len(members) >= 4 or group.get("grouping_reason") == "dense_gallery":
+        return "group-layout-gallery"
+    centers_x = [(image_box(member)[0] + image_box(member)[2]) / 2.0 for member in members]
+    centers_y = [(image_box(member)[1] + image_box(member)[3]) / 2.0 for member in members]
+    horizontal_spread = max(centers_x) - min(centers_x) if centers_x else 0.0
+    vertical_spread = max(centers_y) - min(centers_y) if centers_y else 0.0
+    return "group-layout-stack" if vertical_spread > horizontal_spread * 1.15 else "group-layout-row"
+
+
+def figure_group_html(group: dict, members: list[dict], caption_text: str = "") -> str:
+    renderable_members = [member for member in members if member.get("src")]
+    if len(renderable_members) < 2:
+        return ""
+    group_caption_id = str((group.get("caption_match") or {}).get("caption_id") or "")
+    layout_class = figure_group_layout_class(group, renderable_members)
+    member_html: list[str] = []
+    used_local_caption_ids: set[str] = set()
+    for member in renderable_members:
+        match = member.get("caption_match") or {}
+        local_caption_id = str(match.get("caption_id") or "")
+        local_caption_text = ""
+        if (
+            usable_image_caption(member)
+            and local_caption_id != group_caption_id
+            and local_caption_id not in used_local_caption_ids
+        ):
+            local_caption_text = str(match.get("caption_text") or "")
+            used_local_caption_ids.add(local_caption_id)
+        alt_text = local_caption_text or caption_text or f"Image {member.get('id', '')}".strip()
+        local_label_html = (
+            f'<span class="figure-local-label">{text_with_bidi_isolates(local_caption_text)}</span>'
+            if local_caption_text
+            else ""
+        )
+        member_html.append(
+            f'<div class="figure-group-item" data-image-id="{html.escape(str(member.get("id") or ""))}">'
+            f'<img src="{html.escape(str(member.get("src") or ""))}" alt="{html.escape(alt_text)}" loading="lazy">'
+            f"{local_label_html}</div>"
+        )
+    remaining_labels = [
+        label
+        for label in group.get("local_labels", [])
+        if str(label.get("caption_id") or "") not in used_local_caption_ids
+    ]
+    remaining_labels_html = (
+        '<div class="figure-group-labels">'
+        + "".join(
+            f'<span class="figure-local-label">{text_with_bidi_isolates(str(label.get("text") or ""))}</span>'
+            for label in remaining_labels
+        )
+        + "</div>"
+        if remaining_labels
+        else ""
+    )
+    caption_html = f"<figcaption>{text_with_bidi_isolates(caption_text)}</figcaption>" if caption_text else ""
+    confidence = float(group.get("match_confidence") or 0.0)
+    reason = str(group.get("match_reason") or "")
+    return (
+        f'<figure class="embedded-figure-group {layout_class}" '
+        f'data-group-id="{html.escape(str(group.get("id") or ""))}" '
+        f'data-match-confidence="{confidence:.2f}" data-match-reason="{html.escape(reason)}">'
+        f'<div class="figure-group-grid">{"".join(member_html)}</div>{remaining_labels_html}{caption_html}</figure>'
+    )
+
+
 def pages_to_html(pages: list[dict]) -> str:
     page_html: list[str] = []
     for page in pages:
         page_items = []
         reading_items: list[tuple[str, dict]] = []
+        for index, block in enumerate(page.get("secondary_blocks", []), start=1):
+            block.setdefault("id", f"caption-{index}")
+        image_by_id = {str(image.get("id") or ""): image for image in page.get("image_regions", [])}
+        renderable_groups: list[tuple[dict, list[dict]]] = []
+        grouped_image_ids: set[str] = set()
+        attached_caption_ids: set[str] = set()
+        for group in page.get("figure_groups", []):
+            members = [image_by_id[image_id] for image_id in group.get("member_image_ids", []) if image_id in image_by_id and image_by_id[image_id].get("src")]
+            if len(members) < 2:
+                continue
+            renderable_groups.append((group, members))
+            grouped_image_ids.update(str(member.get("id") or "") for member in members)
+            if usable_image_caption(group):
+                attached_caption_ids.add(str((group.get("caption_match") or {}).get("caption_id") or ""))
+            attached_caption_ids.update(
+                str(label.get("caption_id") or "")
+                for label in group.get("local_labels", [])
+                if label.get("caption_id")
+            )
+            for member in members:
+                if usable_image_caption(member):
+                    attached_caption_ids.add(str((member.get("caption_match") or {}).get("caption_id") or ""))
+        for image in page.get("image_regions", []):
+            if image.get("src") and str(image.get("id") or "") not in grouped_image_ids and usable_image_caption(image):
+                attached_caption_ids.add(str((image.get("caption_match") or {}).get("caption_id") or ""))
+
+        consumed_caption_ids: set[str] = set()
         for block in page["blocks"] + page.get("secondary_blocks", []):
+            if block.get("consumed_by_figure_group") or block.get("consumed_by_image"):
+                continue
             kind = "caption" if block.get("class") == "caption" else "question" if block.get("class") == "question-box" else "body"
+            if kind == "caption" and str(block.get("id") or "") in attached_caption_ids:
+                continue
             reading_items.append((kind, block))
+        for image in page.get("image_regions", []):
+            if image.get("src") and str(image.get("id") or "") not in grouped_image_ids:
+                reading_items.append(("image", image))
+        for group, members in renderable_groups:
+            render_group = dict(group)
+            render_group["members"] = members
+            reading_items.append(("figure_group", render_group))
         for table in page.get("tables", []):
             if table.get("reconstructed") or (table.get("data") and table.get("cols", 0) > 1):
                 reading_items.append(("table", table))
@@ -1634,10 +2711,35 @@ def pages_to_html(pages: list[dict]) -> str:
                     }
                 )
             else:
-                block = item
-                tag = block["tag"]
-                class_attr = f' class="{html.escape(str(block["class"]))}"' if block.get("class") else ""
-                page_items.append({"html": f"<{tag}{class_attr}>{block['html']}</{tag}>"})
+                if kind == "figure_group":
+                    match = item.get("caption_match") or {}
+                    caption_id = str(match.get("caption_id") or "")
+                    caption_text = ""
+                    if usable_image_caption(item) and caption_id not in consumed_caption_ids:
+                        caption_text = str(match.get("caption_text") or "")
+                        consumed_caption_ids.add(caption_id)
+                    figure = figure_group_html(item, item.get("members", []), caption_text=caption_text)
+                    if figure:
+                        page_items.append({"html": figure})
+                elif kind == "image":
+                    match = item.get("caption_match") or {}
+                    caption_id = str(match.get("caption_id") or "")
+                    caption_text = ""
+                    if (
+                        caption_id
+                        and caption_id not in consumed_caption_ids
+                        and usable_image_caption(item)
+                    ):
+                        caption_text = str(match.get("caption_text") or "")
+                        consumed_caption_ids.add(caption_id)
+                    figure = image_figure_html(item, caption_text=caption_text)
+                    if figure:
+                        page_items.append({"html": figure})
+                else:
+                    block = item
+                    tag = block["tag"]
+                    class_attr = f' class="{html.escape(str(block["class"]))}"' if block.get("class") else ""
+                    page_items.append({"html": f"<{tag}{class_attr}>{block['html']}</{tag}>"})
         page_html.append(
             f'<section class="page" id="page-{page["number"]}">'
             f'<div class="page-marker">עמוד {page["number"]}</div>'
@@ -1687,9 +2789,19 @@ def build_conversion_report(
     page_numbers: set[int] | None,
     crop_settings: dict | None,
     structured: bool,
+    images_enabled: bool = True,
+    image_quality: int = IMAGE_JPEG_QUALITY,
+    image_max_width: int = IMAGE_MAX_EMBED_WIDTH,
 ) -> dict:
     tables = [table for page in pages for table in page.get("tables", [])]
     secondary_blocks = [block for page in pages for block in page.get("secondary_blocks", [])]
+    image_regions = [image for page in pages for image in page.get("image_regions", [])]
+    figure_groups = [group for page in pages for group in page.get("figure_groups", [])]
+    embedded_sources = [str(image.get("src") or "") for image in image_regions if image.get("src")]
+    embedded_image_bytes = sum(
+        max(0, (len(source.partition(",")[2]) * 3) // 4 - source.partition(",")[2].count("="))
+        for source in embedded_sources
+    )
     converted_page_numbers = [int(page["number"]) for page in pages]
     return {
         "mode": "structured" if structured else "plain text fallback",
@@ -1702,7 +2814,23 @@ def build_conversion_report(
         "tables_reconstructed": sum(1 for table in tables if table.get("reconstructed")),
         "possible_tables": sum(1 for table in tables if table.get("estimated") and not table.get("reconstructed")),
         "secondary_blocks": len(secondary_blocks),
+        "image_regions": len(image_regions),
+        "figure_groups": len(figure_groups),
+        "images_enabled": images_enabled,
+        "image_quality": image_quality,
+        "image_max_width": image_max_width,
+        "embedded_images": len(embedded_sources),
+        "embedded_image_bytes": embedded_image_bytes,
     }
+
+
+def format_byte_size(value: int | float) -> str:
+    size = max(0.0, float(value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} GB"
 
 
 def conversion_report_to_html(report: dict | None) -> str:
@@ -1717,6 +2845,14 @@ def conversion_report_to_html(report: dict | None) -> str:
         ("Tables reconstructed", report.get("tables_reconstructed", 0)),
         ("Possible tables", report.get("possible_tables", 0)),
         ("Captions / side text", report.get("secondary_blocks", 0)),
+        ("Image regions", report.get("image_regions", 0)),
+        ("Figure groups", report.get("figure_groups", 0)),
+        ("Image embedding", "enabled" if report.get("images_enabled", True) else "disabled"),
+        ("JPEG quality", report.get("image_quality", IMAGE_JPEG_QUALITY) if report.get("images_enabled", True) else "n/a"),
+        ("Maximum image width", f'{report.get("image_max_width", IMAGE_MAX_EMBED_WIDTH)} px' if report.get("images_enabled", True) else "n/a"),
+        ("Images embedded", report.get("embedded_images", 0)),
+        ("Embedded image data", format_byte_size(report.get("embedded_image_bytes", 0))),
+        ("Estimated HTML size", format_byte_size(report.get("estimated_output_bytes", 0))) if report.get("estimated_output_bytes") is not None else ("Estimated HTML size", "pending"),
     ]
     rows_html = "".join(
         f"<dt>{html.escape(str(label))}</dt><dd>{html.escape(str(value))}</dd>"
@@ -1877,6 +3013,135 @@ def build_reader_html(
       color: var(--muted);
       font-size: .88em;
       line-height: 1.65;
+    }}
+    .content .embedded-image {{
+      margin: 1.25em 0 1.45em;
+      padding: 0;
+    }}
+    .content .embedded-image img {{
+      display: block;
+      width: min(100%, 760px);
+      height: auto;
+      margin-inline: auto;
+      border-radius: 6px;
+      background: #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.12);
+    }}
+    .content .embedded-image figcaption {{
+      width: min(100%, 760px);
+      margin: .55em auto 0;
+      color: var(--muted);
+      font-size: .86em;
+      line-height: 1.55;
+      text-align: right;
+    }}
+    .content .embedded-image.caption-above {{
+      display: flex;
+      flex-direction: column;
+    }}
+    .content .embedded-image.caption-above img {{ order: 2; }}
+    .content .embedded-image.caption-above figcaption {{
+      order: 1;
+      margin: 0 auto .55em;
+    }}
+    .content .embedded-image.side-caption {{
+      width: min(100%, 920px);
+      margin-inline: auto;
+      display: grid;
+      grid-template-columns: minmax(0, 3.3fr) minmax(9.5rem, 1fr);
+      gap: clamp(16px, 3vw, 34px);
+      align-items: end;
+      direction: ltr;
+    }}
+    .content .embedded-image.side-caption-right {{
+      grid-template-areas: "image caption";
+    }}
+    .content .embedded-image.side-caption-left {{
+      grid-template-areas: "caption image";
+      grid-template-columns: minmax(9.5rem, 1fr) minmax(0, 3.3fr);
+    }}
+    .content .embedded-image.side-caption img {{
+      grid-area: image;
+      width: 100%;
+      margin: 0;
+    }}
+    .content .embedded-image.side-caption figcaption {{
+      grid-area: caption;
+      width: auto;
+      margin: 0;
+      direction: rtl;
+      padding-block-end: .15em;
+    }}
+    .content .embedded-image.ambiguous-caption figcaption {{
+      border-inline-start: 3px solid var(--line);
+      padding-inline-start: .65em;
+    }}
+    .content .embedded-figure-group {{
+      width: min(100%, 820px);
+      margin: 1.4em auto 1.65em;
+      padding: .8em;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--paper) 94%, var(--accent-soft));
+    }}
+    .content .figure-group-grid {{
+      display: grid;
+      gap: 12px;
+      align-items: start;
+      direction: rtl;
+    }}
+    .content .group-layout-gallery .figure-group-grid {{
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }}
+    .content .group-layout-row .figure-group-grid {{
+      grid-template-columns: repeat(var(--group-columns, 3), minmax(0, 1fr));
+    }}
+    .content .group-layout-stack .figure-group-grid {{
+      grid-template-columns: minmax(0, 1fr);
+      width: min(100%, 520px);
+      margin-inline: auto;
+    }}
+    .content .figure-group-item {{
+      min-width: 0;
+      text-align: center;
+    }}
+    .content .figure-group-item img {{
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 520px;
+      object-fit: contain;
+      margin-inline: auto;
+      border-radius: 6px;
+      background: #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.12);
+    }}
+    .content .figure-local-label {{
+      display: block;
+      margin-top: .38em;
+      color: var(--muted);
+      font-size: .75em;
+      line-height: 1.35;
+    }}
+    .content .figure-group-labels {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: .35em .65em;
+      margin-top: .6em;
+    }}
+    .content .figure-group-labels .figure-local-label {{
+      margin: 0;
+      padding: .2em .5em;
+      border-radius: 999px;
+      background: var(--paper);
+    }}
+    .content .embedded-figure-group > figcaption {{
+      margin: .8em auto 0;
+      color: var(--muted);
+      font-size: .86em;
+      line-height: 1.55;
+      text-align: right;
     }}
     .content .question-box {{
       margin: 1.1em 0 1.35em;
@@ -2048,6 +3313,65 @@ def build_reader_html(
     .detected-table.estimated th {{
       white-space: normal;
     }}
+    .content .embedded-image img,
+    .content .figure-group-item img {{
+      cursor: zoom-in;
+    }}
+    .content .embedded-image img:focus-visible,
+    .content .figure-group-item img:focus-visible {{
+      outline: 3px solid var(--accent);
+      outline-offset: 4px;
+    }}
+    body.lightbox-open {{
+      overflow: hidden;
+    }}
+    .image-lightbox {{
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      padding: max(14px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+      background: rgba(12, 12, 12, .94);
+      color: #fff;
+    }}
+    .image-lightbox[hidden] {{
+      display: none;
+    }}
+    .image-lightbox-close {{
+      justify-self: end;
+      width: 44px;
+      height: 44px;
+      border: 1px solid rgba(255,255,255,.55);
+      border-radius: 50%;
+      padding: 0;
+      background: rgba(0,0,0,.35);
+      color: #fff;
+      font-size: 1.8rem;
+      line-height: 1;
+    }}
+    .image-lightbox img {{
+      display: block;
+      align-self: center;
+      justify-self: center;
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      border-radius: 6px;
+      background: #fff;
+      box-shadow: 0 14px 44px rgba(0,0,0,.45);
+    }}
+    .image-lightbox-caption {{
+      max-width: 900px;
+      margin: 0 auto;
+      color: #f1eee8;
+      font-size: clamp(.88rem, 2.3vw, 1.05rem);
+      line-height: 1.5;
+      text-align: center;
+    }}
     .hidden {{ display: none; }}
     @media (max-width: 760px) {{
       .toolbar {{ grid-template-columns: 1fr; }}
@@ -2056,6 +3380,22 @@ def build_reader_html(
       main {{ padding-inline: 10px; }}
       .reader {{ border-inline: 0; padding-inline: 18px; }}
       .content .question-columns {{ grid-template-columns: 1fr; }}
+      .content .embedded-image.side-caption,
+      .content .embedded-image.side-caption-left,
+      .content .embedded-image.side-caption-right {{
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "image" "caption";
+        gap: 0;
+        direction: rtl;
+      }}
+      .content .embedded-image.side-caption figcaption {{
+        width: min(100%, 760px);
+        margin: .55em auto 0;
+      }}
+      .content .embedded-figure-group {{ padding: .6em; }}
+      .content .group-layout-gallery .figure-group-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .content .group-layout-row .figure-group-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .table-preview-wrap {{
         overflow-x: auto;
         overscroll-behavior-inline: contain;
@@ -2190,6 +3530,11 @@ def build_reader_html(
     {report_html}
     <article class="reader" id="reader" aria-live="polite"></article>
   </main>
+  <div class="image-lightbox" id="imageLightbox" role="dialog" aria-modal="true" aria-label="Image viewer" hidden>
+    <button class="image-lightbox-close" id="imageLightboxClose" type="button" aria-label="Close image viewer">&times;</button>
+    <img id="imageLightboxImage" alt="">
+    <p class="image-lightbox-caption" id="imageLightboxCaption"></p>
+  </div>
   <script type="application/json" id="source-text">{source_json}</script>
   <script type="application/json" id="source-html">{reader_html_json}</script>
   <script>
@@ -2199,6 +3544,11 @@ def build_reader_html(
     const stats = document.getElementById('stats');
     const query = document.getElementById('query');
     const root = document.documentElement;
+    const imageLightbox = document.getElementById('imageLightbox');
+    const imageLightboxImage = document.getElementById('imageLightboxImage');
+    const imageLightboxCaption = document.getElementById('imageLightboxCaption');
+    const imageLightboxClose = document.getElementById('imageLightboxClose');
+    let imageLightboxTrigger = null;
     let fontSize = Number(localStorage.getItem('readerFontSize')) || 21;
     let lineMode = Number(localStorage.getItem('readerLineMode')) || 0;
     const lineHeights = [1.9, 2.15, 1.65];
@@ -2294,6 +3644,45 @@ def build_reader_html(
       }});
     }}
 
+    function closeImageLightbox() {{
+      if (imageLightbox.hidden) return;
+      imageLightbox.hidden = true;
+      imageLightboxImage.removeAttribute('src');
+      imageLightboxCaption.textContent = '';
+      document.body.classList.remove('lightbox-open');
+      imageLightboxTrigger?.focus();
+      imageLightboxTrigger = null;
+    }}
+
+    function openImageLightbox(image) {{
+      imageLightboxTrigger = image;
+      imageLightboxImage.src = image.currentSrc || image.src;
+      imageLightboxImage.alt = image.alt || '';
+      const figure = image.closest('figure');
+      const localLabel = image.closest('.figure-group-item')?.querySelector('.figure-local-label');
+      const sharedCaption = figure?.querySelector(':scope > figcaption');
+      imageLightboxCaption.textContent = localLabel?.textContent?.trim() || sharedCaption?.textContent?.trim() || image.alt || '';
+      imageLightbox.hidden = false;
+      document.body.classList.add('lightbox-open');
+      imageLightboxClose.focus();
+    }}
+
+    function enhanceImageLightbox() {{
+      reader.querySelectorAll('.embedded-image img, .figure-group-item img').forEach(image => {{
+        if (image.dataset.lightboxEnhanced) return;
+        image.dataset.lightboxEnhanced = 'true';
+        image.tabIndex = 0;
+        image.setAttribute('role', 'button');
+        image.setAttribute('aria-label', `${{image.alt || 'Image'}} - open enlarged image`);
+        image.addEventListener('click', () => openImageLightbox(image));
+        image.addEventListener('keydown', event => {{
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          openImageLightbox(image);
+        }});
+      }});
+    }}
+
     function render() {{
       const pages = splitPages(source);
       const needle = query.value;
@@ -2313,6 +3702,7 @@ def build_reader_html(
         highlightInPlace(needle);
       }}
       enhanceTableCarousels();
+      enhanceImageLightbox();
       const wordCount = source.split(/\\s+/).filter(Boolean).length;
       stats.textContent = `${{pages.length}} עמודים · כ-${{wordCount.toLocaleString('he-IL')}} מילים · מקור: {source_html}`;
     }}
@@ -2357,6 +3747,13 @@ def build_reader_html(
       query.focus();
     }});
     query.addEventListener('input', render);
+    imageLightboxClose.addEventListener('click', closeImageLightbox);
+    imageLightbox.addEventListener('click', event => {{
+      if (event.target === imageLightbox) closeImageLightbox();
+    }});
+    document.addEventListener('keydown', event => {{
+      if (event.key === 'Escape') closeImageLightbox();
+    }});
 
     const savedWidth = localStorage.getItem('readerWidth');
     if (savedWidth) {{
@@ -2381,12 +3778,19 @@ def create_reader(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     crop_settings: dict | None = None,
     page_numbers: set[int] | None = None,
+    *,
+    embed_images: bool = True,
+    image_quality: int = IMAGE_JPEG_QUALITY,
+    image_max_width: int = IMAGE_MAX_EMBED_WIDTH,
+    progress_callback=None,
 ) -> Path:
     pdf_path = pdf_path.expanduser().resolve()
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
     if pdf_path.suffix.lower() != ".pdf":
         raise ValueError("Input file must be a PDF")
+    image_quality = validate_image_quality(image_quality)
+    image_max_width = validate_image_max_width(image_max_width)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     total_source_pages = len(PdfReader(str(pdf_path)).pages)
@@ -2397,6 +3801,10 @@ def create_reader(
             pdf_path,
             crop_settings=crop_settings,
             page_numbers=page_numbers,
+            embed_images=embed_images,
+            image_quality=image_quality,
+            image_max_width=image_max_width,
+            progress_callback=progress_callback,
         )
         reader_html = pages_to_html(pages)
         report = build_conversion_report(
@@ -2405,6 +3813,9 @@ def create_reader(
             page_numbers=page_numbers,
             crop_settings=crop_settings,
             structured=True,
+            images_enabled=embed_images,
+            image_quality=image_quality,
+            image_max_width=image_max_width,
         )
     except Exception:
         text, page_count, char_count = extract_pdf_text(
@@ -2421,11 +3832,16 @@ def create_reader(
             page_numbers=page_numbers,
             crop_settings=crop_settings,
             structured=False,
+            images_enabled=embed_images,
+            image_quality=image_quality,
+            image_max_width=image_max_width,
         )
     if char_count == 0:
         raise ValueError("No text layer was found in this PDF. OCR is required for scanned-only PDFs.")
 
     title = guess_title(text, pdf_path.stem)
+    html_doc = build_reader_html(text, title=title, source_name=pdf_path.name, reader_html=reader_html, report=report)
+    report["estimated_output_bytes"] = len(html_doc.encode("utf-8-sig"))
     html_doc = build_reader_html(text, title=title, source_name=pdf_path.name, reader_html=reader_html, report=report)
     output_path = output_dir / f"{safe_slug(pdf_path.name)}-reader.html"
     output_path.write_text(html_doc, encoding="utf-8-sig")
@@ -2584,6 +4000,9 @@ class ReaderToolHandler(BaseHTTPRequestHandler):
                 return
             crop_settings = crop_settings_from_fields(fields)
             page_numbers = parse_page_ranges(fields.get("page_range"))
+            embed_images = fields.get("no_images") not in {"on", "true", "1"}
+            image_quality = validate_image_quality(int(fields.get("image_quality") or IMAGE_JPEG_QUALITY))
+            image_max_width = validate_image_max_width(int(fields.get("image_max_width") or IMAGE_MAX_EMBED_WIDTH))
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 input_path = Path(tmpdir) / f"{uuid.uuid4()}.pdf"
@@ -2593,6 +4012,9 @@ class ReaderToolHandler(BaseHTTPRequestHandler):
                     DEFAULT_OUTPUT_DIR,
                     crop_settings=crop_settings,
                     page_numbers=page_numbers,
+                    embed_images=embed_images,
+                    image_quality=image_quality,
+                    image_max_width=image_max_width,
                 )
                 final_path = output_path.with_name(f"{safe_slug(filename)}-reader.html")
                 if final_path != output_path:
@@ -2669,6 +4091,17 @@ UPLOAD_PAGE = """<!doctype html>
     .field span {
       color: #61594f;
       font-size: 13px;
+    }
+    .field.checkbox {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .field.checkbox input {
+      min-height: 0;
+      width: 20px;
+      height: 20px;
+      margin: 0;
     }
     .crop-tools {
       margin-top: 20px;
@@ -2808,6 +4241,15 @@ UPLOAD_PAGE = """<!doctype html>
       <label class="field">Page range
         <input type="text" name="page_range" placeholder="all pages, or 1-5,8,12" inputmode="numeric">
         <span>Leave empty to convert the full PDF. Use this for quick tests before converting the whole book.</span>
+      </label>
+      <label class="field checkbox"><input type="checkbox" name="no_images"> Skip embedded images</label>
+      <label class="field">JPEG image quality
+        <input type="number" name="image_quality" min="35" max="95" value="84" inputmode="numeric">
+        <span>Lower values create smaller standalone HTML files. Recommended range: 65-84.</span>
+      </label>
+      <label class="field">Maximum image width (pixels)
+        <input type="number" name="image_max_width" min="240" max="2000" value="900" inputmode="numeric">
+        <span>Use 600-900 for mobile reading; larger values preserve more detail.</span>
       </label>
       <section class="crop-tools" aria-label="גבולות סריקה">
         <h2>גבולות סריקה</h2>
@@ -2993,6 +4435,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--right-crop", help="Odd/right page crop as top,right,bottom,left percentages")
     parser.add_argument("--left-crop", help="Even/left page crop as top,right,bottom,left percentages")
     parser.add_argument("--pages", help="Optional page range to convert, for example: 1-5,8,12")
+    parser.add_argument("--no-images", action="store_true", help="Do not render or embed PDF images")
+    parser.add_argument("--image-quality", type=int, default=IMAGE_JPEG_QUALITY, help="Embedded JPEG quality from 35 to 95 (default: 84)")
+    parser.add_argument("--image-max-width", type=int, default=IMAGE_MAX_EMBED_WIDTH, help="Maximum embedded image width in pixels from 240 to 2000 (default: 900)")
     parser.add_argument("--debug-layout", action="store_true", help="Write a JSON layout debug report instead of a reader")
     args = parser.parse_args(argv)
 
@@ -3024,6 +4469,10 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.output_dir),
                 crop_settings=crop_settings,
                 page_numbers=page_numbers,
+                embed_images=not args.no_images,
+                image_quality=args.image_quality,
+                image_max_width=args.image_max_width,
+                progress_callback=lambda message: print(message, file=sys.stderr),
             )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -1,5 +1,8 @@
 from pathlib import Path
 import importlib.util
+from io import BytesIO
+
+from pypdf import PdfReader, PdfWriter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,33 @@ def test_page_range_parser() -> None:
     assert tool.page_range_label({1, 2, 3, 5, 8, 9}) == "1-3, 5, 8-9"
     assert tool.requested_page_indices(10, None) == list(range(10))
     assert tool.requested_page_indices(10, {8, 2, 99}) == [1, 7]
+
+
+def test_pdf_outline_is_flattened_into_selectable_page_ranges() -> None:
+    writer = PdfWriter()
+    for _ in range(5):
+        writer.add_blank_page(width=300, height=400)
+    chapter_one = writer.add_outline_item("Chapter 1", 0)
+    writer.add_outline_item("Section A", 0, parent=chapter_one)
+    writer.add_outline_item("Section B", 2, parent=chapter_one)
+    writer.add_outline_item("Chapter 2", 4)
+    buffer = BytesIO()
+    writer.write(buffer)
+
+    outline = tool.extract_pdf_outline(PdfReader(BytesIO(buffer.getvalue())))
+
+    assert [(item["title"], item["level"], item["page_range"]) for item in outline] == [
+        ("Chapter 1", 0, "1-4"),
+        ("Section A", 1, "1-2"),
+        ("Section B", 1, "3-4"),
+        ("Chapter 2", 0, "5"),
+    ]
+    assert 'id="tocTools"' in tool.UPLOAD_PAGE
+    assert "renderOutline(data.outline" in tool.UPLOAD_PAGE
+    reader_html = tool.build_reader_html("text", "Reader", "source.pdf")
+    assert 'id="printReader"' in reader_html
+    assert "window.print()" in reader_html
+    assert "@media print" in reader_html
 
 
 def test_safe_slug_preserves_hebrew_names() -> None:
@@ -55,6 +85,8 @@ def test_reader_html_includes_accessible_image_lightbox() -> None:
     assert "image.setAttribute('role', 'button')" in rendered
     assert "if (event.key === 'Escape') closeImageLightbox();" in rendered
     assert ".image-lightbox[hidden]" in rendered
+    assert "text-align: justify;" in rendered
+    assert "text-align-last: right;" in rendered
 
 
 def test_image_embedding_options_validate_ranges() -> None:
@@ -233,7 +265,20 @@ def test_split_ltr_citation_is_repaired_before_rendering() -> None:
     rendered = tool.text_with_bidi_isolates(repaired)
 
     assert repaired == "ביותר לקדם התפתחות (Klahr, Matlin, & Jirout, 2013; Siegler & Svetina, 2006)."
-    assert '<bdi dir="ltr">(Klahr, Matlin, &amp; Jirout, 2013; Siegler &amp; Svetina, 2006)</bdi>' in rendered
+    assert 'class="citation-marker"' in rendered
+    assert '<span class="citation-popover" role="tooltip"><bdi dir="ltr">(Klahr, Matlin, &amp; Jirout, 2013; Siegler &amp; Svetina, 2006)</bdi>' in rendered
+
+
+def test_parenthetical_research_citation_uses_popup_but_plain_english_term_does_not() -> None:
+    rendered = tool.text_with_bidi_isolates("המחקר (Munakata, 2006) משתמש בקלט (input)")
+    reader = tool.build_reader_html("plain", "Reader", "source.pdf", reader_html=f"<p>{rendered}</p>")
+
+    assert rendered.count('class="citation-marker"') == 1
+    assert 'Research citation: Munakata, 2006' in rendered
+    assert '<bdi dir="ltr">(input)</bdi>' in rendered
+    assert ".research-citation:hover .citation-popover" in reader
+    assert "function enhanceResearchCitations()" in reader
+    assert "enhanceResearchCitations();" in reader
 
 
 def test_split_ltr_citation_is_repaired_across_paragraph_lines() -> None:
@@ -969,8 +1014,354 @@ def test_pages_to_html_without_embedded_images_keeps_caption_text() -> None:
     assert '<aside class="caption">Visible caption</aside>' in rendered
 
 
+def test_glossary_term_requires_color_and_matching_body_occurrence() -> None:
+    def line(text: str, x0: float, x1: float, top: float, *, turquoise_text: str = "", ratio: float = 0.0) -> dict:
+        return {
+            "text": text,
+            "x0": x0,
+            "x1": x1,
+            "top": top,
+            "bottom": top + 10.0,
+            "size": 10.0,
+            "font": "David",
+            "style_words": [],
+            "turquoise_text": turquoise_text,
+            "turquoise_ratio": ratio,
+        }
+
+    body = line(
+        "על פי התיאוריה הקוגניטיבית־התפתחותית ילדים מבנים ידע באופן פעיל",
+        200.0,
+        560.0,
+        100.0,
+        turquoise_text="התיאוריה הקוגניטיבית־התפתחותית",
+        ratio=0.2,
+    )
+    term_lines = [
+        line("תיאוריה קוגניטיבית־", 80.0, 180.0, 100.0, turquoise_text="תיאוריה קוגניטיבית־", ratio=1.0),
+        line("התפתחותית", 120.0, 180.0, 111.0, turquoise_text="התפתחותית", ratio=1.0),
+    ]
+    ordinary_margin_text = line("טקסט רגיל בשוליים שאינו מונח", 75.0, 180.0, 150.0)
+
+    remaining, terms = tool.extract_glossary_terms(
+        [body, *term_lines, ordinary_margin_text],
+        body_size=10.0,
+        page_width=620.0,
+    )
+
+    assert len(terms) == 1
+    assert terms[0]["match_reason"] == "turquoise_semantic_duplicate"
+    assert terms[0]["side"] == "left"
+    assert terms[0]["match_confidence"] >= 0.9
+    assert body in remaining
+    assert ordinary_margin_text in remaining
+    assert all(term_line not in remaining for term_line in term_lines)
+
+
+def test_bold_visual_margin_term_is_separated_from_merged_body_text() -> None:
+    hebrew_term = "\u05d2\u05de\u05d9\u05e9\u05d5\u05ea"
+    turquoise = (0.0, 0.663, 0.627)
+    body = {
+        "text": f"\u05d4\u05ea\u05e4\u05ea\u05d7\u05d5\u05ea {hebrew_term} \u05d1\u05de\u05e8\u05d5\u05e6\u05ea \u05db\u05dc \u05d4\u05d7\u05d9\u05d9\u05dd {hebrew_term} (plasticity)",
+        "x0": 205.0,
+        "x1": 560.0,
+        "top": 100.0,
+        "bottom": 110.0,
+        "size": 10.0,
+        "font": "David",
+        "turquoise_text": hebrew_term,
+        "turquoise_ratio": 0.1,
+        "style_words": [
+            {"text": hebrew_term, "font": "David-Bold", "color": turquoise, "x0": 280.0, "x1": 315.0, "size": 10.0}
+        ],
+    }
+    margin = {
+        "text": f") plasticity ( {hebrew_term[::-1]}",
+        "raw_text": f") plasticity ( {hebrew_term[::-1]}",
+        "x0": 110.0,
+        "x1": 190.0,
+        "top": 100.0,
+        "bottom": 110.0,
+        "size": 10.0,
+        "font": "David",
+        "base_direction": "rtl",
+        "turquoise_text": f"{hebrew_term} ) plasticity (",
+        "turquoise_ratio": 1.0,
+        "style_words": [
+            {"text": hebrew_term, "font": "David-Bold", "color": turquoise, "x0": 160.0, "x1": 190.0, "size": 10.0},
+            {"text": ")", "font": "David", "color": turquoise, "x0": 155.0, "x1": 158.0, "size": 10.0},
+            {"text": "plasticity", "font": "Times-Roman", "color": turquoise, "x0": 118.0, "x1": 153.0, "size": 10.0},
+            {"text": "(", "font": "David", "color": turquoise, "x0": 112.0, "x1": 116.0, "size": 10.0},
+        ],
+    }
+
+    remaining, terms = tool.extract_glossary_terms(
+        [body],
+        body_size=10.0,
+        page_width=620.0,
+        visual_lines=[margin],
+    )
+
+    assert len(terms) == 1
+    assert terms[0]["text"] == f"{hebrew_term} (plasticity)"
+    assert terms[0]["source"] == "visual_margin"
+    assert terms[0]["match_reason"] == "bold_margin_semantic_duplicate"
+    assert terms[0]["duplicate_removed"] == f"{hebrew_term} (plasticity)"
+    assert remaining[0]["text"] == f"\u05d4\u05ea\u05e4\u05ea\u05d7\u05d5\u05ea {hebrew_term} \u05d1\u05de\u05e8\u05d5\u05e6\u05ea \u05db\u05dc \u05d4\u05d7\u05d9\u05d9\u05dd"
+
+    unmatched_margin = dict(margin)
+    unmatched_margin["style_words"] = [
+        {**word, "text": "\u05de\u05d5\u05e0\u05d7\u05be\u05d0\u05d7\u05e8" if index == 0 else word["text"]}
+        for index, word in enumerate(margin["style_words"])
+    ]
+    _, unmatched_terms = tool.extract_glossary_terms(
+        [dict(body, text=f"\u05d4\u05ea\u05e4\u05ea\u05d7\u05d5\u05ea {hebrew_term} \u05d1\u05de\u05e8\u05d5\u05e6\u05ea \u05db\u05dc \u05d4\u05d7\u05d9\u05d9\u05dd")],
+        body_size=10.0,
+        page_width=620.0,
+        visual_lines=[unmatched_margin],
+    )
+    assert unmatched_terms == []
+
+
+def test_glossary_term_renders_beside_linked_paragraph_with_mobile_fallback() -> None:
+    body_line = {
+        "text": "פסקה עם מונח מיוחד",
+        "x0": 200.0,
+        "x1": 560.0,
+        "top": 100.0,
+        "bottom": 110.0,
+        "size": 10.0,
+        "font": "David",
+        "style_words": [],
+    }
+    block = tool.render_body_block({"id": "body-1", "lines": [body_line]}, 10.0)
+    block["glossary_terms"] = [
+        {
+            "text": "מונח מיוחד",
+            "body_term_text": "מונח מיוחד",
+            "html": "מונח מיוחד<br><bdi dir=\"ltr\">special term</bdi>",
+            "side": "left",
+            "match_confidence": 0.96,
+            "block_offset_em": 7.5,
+        }
+    ]
+    page = {
+        "number": 1,
+        "width": 620.0,
+        "lines": [body_line],
+        "blocks": [block],
+        "secondary_blocks": [],
+        "image_regions": [],
+        "figure_groups": [],
+        "tables": [],
+    }
+
+    page_html = tool.pages_to_html([page])
+    reader = tool.build_reader_html("plain", "Reader", "source.pdf", reader_html=page_html)
+
+    assert 'class="body-with-glossary glossary-left"' in page_html
+    assert page_html.count('class="glossary-term"') == 1
+    assert "special term" in page_html
+    assert 'data-body-term="מונח מיוחד"' in page_html
+    assert 'style="--glossary-offset:7.50em"' in page_html
+    assert "position: absolute;" in reader
+    assert "right: calc(100% +" in reader
+    assert "function enhanceGlossaryPopovers()" in reader
+
+
+def test_positioned_table_reconstruction_uses_repeated_text_columns() -> None:
+    def cell(text: str, x0: float, x1: float, top: float) -> dict:
+        return {
+            "text": text,
+            "raw_text": text,
+            "x0": x0,
+            "x1": x1,
+            "top": top,
+            "bottom": top + 10.0,
+            "size": 10.0,
+            "font": "David",
+            "style_words": [{"text": text, "x0": x0, "x1": x1, "size": 10.0, "font": "David"}],
+        }
+
+    marker = cell("טבלה 9.9 טבלת בדיקה", 300.0, 550.0, 100.0)
+    lines = [
+        marker,
+        cell("כותרת א", 470.0, 550.0, 130.0),
+        cell("כותרת ב", 320.0, 400.0, 130.0),
+        cell("כותרת ג", 120.0, 200.0, 130.0),
+        cell("אחד", 470.0, 550.0, 160.0),
+        cell("שתיים", 320.0, 400.0, 160.0),
+        cell("שלוש", 120.0, 200.0, 160.0),
+        cell("ארבע", 470.0, 550.0, 190.0),
+        cell("חמש", 320.0, 400.0, 190.0),
+        cell("שש", 120.0, 200.0, 190.0),
+    ]
+
+    tables = tool.detect_text_table_markers(lines, page_width=620.0, positioned_lines=lines)
+
+    assert len(tables) == 1
+    assert tables[0]["reconstructed"] is True
+    assert tables[0]["rows"] == 3
+    assert tables[0]["cols"] == 3
+    assert tables[0]["data"][0] == ["כותרת א", "כותרת ב", "כותרת ג"]
+
+    continuation = tool.detect_unmarked_positioned_table(lines[1:], 620.0, 800.0)
+    assert continuation is not None
+    assert continuation["continuation"] is True
+    assert continuation["rows"] == 3
+    assert continuation["cols"] == 3
+
+    reference = cell("ראו טבלה 9.9 לפרטים", 200.0, 550.0, 80.0)
+    assert tool.detect_text_table_markers([reference, *lines[1:]], page_width=620.0) == []
+
+
+def test_token_direction_classifies_rtl_ltr_mixed_and_neutral_text() -> None:
+    assert tool.token_direction("\u05e9\u05dc\u05d5\u05dd") == "rtl"
+    assert tool.token_direction("Locke 1690") == "ltr"
+    assert tool.token_direction("\u05dc\u05d5\u05e7 Locke") == "mixed"
+    assert tool.token_direction("— ()") == "neutral"
+
+
+def test_character_geometry_confirms_or_repairs_hebrew_word_order() -> None:
+    logical = "\u05e9\u05dc\u05d5\u05dd"
+    characters = [
+        {"text": character, "x0": x0, "x1": x0 + 8.0, "top": 10.0, "bottom": 20.0}
+        for character, x0 in zip(logical, (140.0, 130.0, 120.0, 110.0))
+    ]
+    base_word = {"x0": 108.0, "x1": 150.0, "top": 10.0, "bottom": 20.0, "size": 12.0}
+
+    confirmed = tool.enrich_words_with_character_order([{**base_word, "text": logical}], characters)[0]
+    repaired = tool.enrich_words_with_character_order([{**base_word, "text": logical[::-1]}], characters)[0]
+
+    assert confirmed["logical_text"] == logical
+    assert confirmed["order_source"] == "word_extractor_confirmed"
+    assert repaired["logical_text"] == logical
+    assert repaired["order_source"] == "character_geometry"
+    assert repaired["order_confidence"] >= 0.9
+
+
+def test_ltr_line_keeps_spatial_word_order() -> None:
+    line = tool.line_from_words(
+        [
+            {"text": "John", "logical_text": "John", "direction": "ltr", "x0": 10.0, "x1": 35.0, "top": 10.0, "bottom": 20.0, "size": 12.0},
+            {"text": "Locke", "logical_text": "Locke", "direction": "ltr", "x0": 40.0, "x1": 70.0, "top": 10.0, "bottom": 20.0, "size": 12.0},
+        ]
+    )
+
+    assert line["base_direction"] == "ltr"
+    assert [word["text"] for word in line["style_words"]] == ["John", "Locke"]
+    assert tool.visual_style_words_to_logical_text(line) == "John Locke"
+
+
+def test_monotonic_alignment_preserves_duplicate_line_order() -> None:
+    def visual(text: str, top: float) -> dict:
+        return {
+            "text": text,
+            "top": top,
+            "bottom": top + 10.0,
+            "x0": 100.0,
+            "x1": 500.0,
+            "size": 12.0,
+            "base_direction": "ltr",
+            "style_words": [{"text": text}],
+        }
+
+    corrected = tool.align_text_lines_to_style_lines(
+        ["same repeated line", "middle unique line", "same repeated line"],
+        [visual("same repeated line", 10.0), visual("middle unique line", 30.0), visual("same repeated line", 50.0)],
+    )
+
+    assert [line["top"] for line in corrected] == [10.0, 30.0, 50.0]
+    assert [line["logical_index"] for line in corrected] == [0, 1, 2]
+    assert all(line["alignment_reason"] == "monotonic_text_geometry" for line in corrected)
+
+
+def test_high_confidence_alignment_recovers_out_of_flow_margin_text() -> None:
+    def visual(text: str, top: float, x0: float, x1: float) -> dict:
+        return {
+            "text": text,
+            "top": top,
+            "bottom": top + 10.0,
+            "x0": x0,
+            "x1": x1,
+            "size": 12.0,
+            "base_direction": "ltr",
+            "style_words": [{"text": text}],
+        }
+
+    corrected = tool.align_text_lines_to_style_lines(
+        ["first body line", "second body line", "margin caption"],
+        [
+            visual("margin caption", 5.0, 520.0, 600.0),
+            visual("first body line", 10.0, 100.0, 500.0),
+            visual("second body line", 30.0, 100.0, 500.0),
+        ],
+    )
+    by_text = {line["text"]: line for line in corrected}
+
+    assert by_text["first body line"]["alignment_reason"] == "monotonic_text_geometry"
+    assert by_text["second body line"]["alignment_reason"] == "monotonic_text_geometry"
+    assert by_text["margin caption"]["alignment_reason"] == "high_confidence_geometry_recovery"
+    assert by_text["margin caption"]["x0"] == 520.0
+
+
+def test_line_debug_record_includes_order_diagnostics() -> None:
+    line = tool.line_from_words(
+        [{"text": "Locke", "logical_text": "Locke", "direction": "ltr", "order_source": "word_extractor_confirmed", "order_confidence": 0.99, "x0": 10.0, "x1": 40.0, "top": 10.0, "bottom": 20.0, "size": 12.0}]
+    )
+    line.update({"alignment_reason": "monotonic_text_geometry", "alignment_score": 0.98, "logical_index": 2})
+
+    record = tool.line_debug_record(line)
+
+    assert record["base_direction"] == "ltr"
+    assert record["word_order_source"] == "ltr_spatial"
+    assert record["alignment_reason"] == "monotonic_text_geometry"
+    assert record["logical_index"] == 2
+    assert record["token_order"][0]["order_source"] == "word_extractor_confirmed"
+
+
+def test_mixed_rtl_visual_words_restore_run_in_heading_order() -> None:
+    logical_words = [
+        "ג'ון", "לוק", "כתביו", "של", "הפילוסוף", "הבריטי", "ג'ון", "לוק",
+        "(", "1632-1704", "Locke,", "John", ")", "בישרו", "השקפה",
+    ]
+    visual_line = {
+        "text": "scrambled visual line",
+        "top": 100.0,
+        "bottom": 110.0,
+        "x0": 200.0,
+        "x1": 560.0,
+        "size": 10.0,
+        "font": "David",
+        "style_words": [{"text": word, "size": 10.0, "font": "David"} for word in logical_words],
+    }
+    scrambled_logical_layer = "בישרו השקפה (John Locke, 1632-1704) ג'ון לוק כתביו של הפילוסוף הבריטי ג'ון לוק"
+
+    corrected = tool.align_text_lines_to_style_lines([scrambled_logical_layer], [visual_line])
+
+    assert len(corrected) == 1
+    assert corrected[0]["text"] == "ג'ון לוק כתביו של הפילוסוף הבריטי ג'ון לוק (John Locke, 1632-1704) בישרו השקפה"
+    assert corrected[0]["text_source"] == "visual_mixed_order"
+
+
+def test_bold_outer_margin_heading_is_not_added_to_body_flow() -> None:
+    lines = [
+        {"text": "שורת טקסט מרכזית ארוכה ראשונה", "top": 100.0, "bottom": 110.0, "x0": 200.0, "x1": 560.0, "size": 10.0, "font": "David"},
+        {"text": "שורת טקסט מרכזית ארוכה שנייה", "top": 115.0, "bottom": 125.0, "x0": 200.0, "x1": 560.0, "size": 10.0, "font": "David"},
+        {"text": "שורת טקסט מרכזית ארוכה שלישית", "top": 130.0, "bottom": 140.0, "x0": 200.0, "x1": 560.0, "size": 10.0, "font": "David"},
+        {"text": "כותרת שוליים", "top": 115.0, "bottom": 127.0, "x0": 570.0, "x1": 630.0, "size": 12.0, "font": "Arial-BoldMT"},
+    ]
+
+    flow, secondary = tool.separate_secondary_text(lines, body_size=10.0, page_width=637.0)
+
+    assert [line["text"] for line in flow] == [line["text"] for line in lines[:3]]
+    assert len(secondary) == 1
+    assert tool.block_plain_text(secondary[0]) == "כותרת שוליים"
+
+
 if __name__ == "__main__":
     test_page_range_parser()
+    test_pdf_outline_is_flattened_into_selectable_page_ranges()
     test_safe_slug_preserves_hebrew_names()
     test_conversion_report_html()
     test_reader_html_includes_accessible_image_lightbox()
@@ -987,6 +1378,7 @@ if __name__ == "__main__":
     test_hebrew_similarity_matches_mixed_citation_line()
     test_ltr_citation_is_rendered_as_bidi_isolate()
     test_split_ltr_citation_is_repaired_before_rendering()
+    test_parenthetical_research_citation_uses_popup_but_plain_english_term_does_not()
     test_split_ltr_citation_is_repaired_across_paragraph_lines()
     test_parenthetical_reference_list_is_repaired_across_lines()
     test_question_callout_uses_visual_column_order()
@@ -1019,4 +1411,16 @@ if __name__ == "__main__":
     test_side_caption_figure_uses_source_side_and_responsive_css()
     test_pages_to_html_replaces_grouped_images_with_one_group_figure()
     test_pages_to_html_without_embedded_images_keeps_caption_text()
+    test_glossary_term_requires_color_and_matching_body_occurrence()
+    test_bold_visual_margin_term_is_separated_from_merged_body_text()
+    test_glossary_term_renders_beside_linked_paragraph_with_mobile_fallback()
+    test_positioned_table_reconstruction_uses_repeated_text_columns()
+    test_token_direction_classifies_rtl_ltr_mixed_and_neutral_text()
+    test_character_geometry_confirms_or_repairs_hebrew_word_order()
+    test_ltr_line_keeps_spatial_word_order()
+    test_monotonic_alignment_preserves_duplicate_line_order()
+    test_high_confidence_alignment_recovers_out_of_flow_margin_text()
+    test_line_debug_record_includes_order_diagnostics()
+    test_mixed_rtl_visual_words_restore_run_in_heading_order()
+    test_bold_outer_margin_heading_is_not_added_to_body_flow()
     print("smoke tests passed")

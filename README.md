@@ -47,6 +47,14 @@ python src\pdf_reader_tool.py "C:\path\to\book.pdf" --pages "1-5,8,12"
 
 For long books, `--pages` limits both layout extraction and logical text extraction to the selected pages, so sampled checks stay fast.
 
+Create or reuse a structured extraction cache while converting:
+
+```powershell
+python src\pdf_reader_tool.py "C:\path\to\book.pdf" --cache
+```
+
+The first run extracts the requested pages into `extraction-cache\<book>.pdfcache`. Later runs load those pages from the cache and add only pages that are missing. Use `--cache "C:\path\to\book.pdfcache"` to choose a specific cache file. `--cache` also works with `--pages` and `--debug-layout`.
+
 Reduce standalone HTML size by lowering embedded-image quality and dimensions:
 
 ```powershell
@@ -81,6 +89,10 @@ python src\pdf_reader_tool.py "C:\path\to\book.pdf" --pages "3-4" --debug-layout
 
 The debug report includes visual lines, aligned logical lines, tables, text classification, `noise_lines`, conservative body-block merge metadata, `image_regions`, `figure_groups`, and layout `regions` for the current reading-order pass.
 
+Word ordering combines Unicode token direction with positioned PDF characters. The logical word extractor is kept when character geometry confirms it; character-level reconstruction is used only when the glyph positions show that a word is reversed. Logical text lines are matched to visual lines with an order-preserving pass, followed by high-confidence geometry recovery for out-of-flow captions and margin notes. Debug line records expose `base_direction`, `word_order_source`, `word_order_confidence`, `alignment_reason`, `alignment_score`, `logical_index`, and per-token ordering metadata.
+
+Short bold or turquoise terminology notes in an outer margin are linked to the matching emphasized occurrence in the body and rendered beside that paragraph. Margin position alone is not treated as evidence: the note must have term-like styling and a strong semantic match in the main body band. If the PDF logical layer appended the margin label to a body line, that duplicate is removed after the match is confirmed. Desktop readers preserve the approximate vertical alignment; narrow screens place the term above its linked paragraph.
+
 The reader uses these regions for a basic reading-order pass: items in the same vertical band are ordered right-to-left, while clearly separated items keep their top-to-bottom order. Adjacent body blocks may be merged only when they are in the same horizontal region and do not look like headings, captions, tables, or question boxes.
 
 Image regions include tentative caption matching fields such as `nearest_caption_id`, `match_confidence`, `match_reason`, `group_candidate`, and `ambiguous_caption_candidates`. The generated reader embeds cropped image figures from these regions, while low-confidence captions remain separate text.
@@ -103,10 +115,59 @@ Then open:
 http://127.0.0.1:8765/
 ```
 
+After a PDF is selected, the preview response also reads its built-in outline/bookmarks. If an outline exists, the upload form shows a nested table-of-contents selector. Selecting one or more chapters or sections converts their PDF destinations into a compact physical page range; that range controls which pages are rendered into the standalone reader. PDFs without an outline keep the manual page-range workflow. Generated readers include a print button and print only the pages included in that reader, with controls and reports removed from the print layout.
+
+## Reusable Structured Extraction Cache
+
+`pdf_cache_tool.py` can scan a book before conversion and save its reusable raw layout data. The main reader consumes the same cache format through `--cache`, and the local upload UI enables cache reuse by default. The cache keeps the logical text, positioned words and characters, font/color attributes, image metadata, vector geometry, annotations, and initial table candidates for every cached page.
+
+Build a cache for an entire book:
+
+```powershell
+python src\pdf_cache_tool.py build "input\book.pdf"
+```
+
+The default output is `extraction-cache\book.pdfcache`. Cache files are ignored by Git because they are generated from local PDFs and may be large.
+
+Cache files contain extracted book text and may contain rendered pages. Keep `extraction-cache\` private and delete caches you no longer need.
+
+Interrupted builds are resumable. Running the same command again verifies the PDF fingerprint, skips pages already present, and continues with missing pages. A cache cannot accidentally be reused for a different PDF.
+
+For a small test range or a custom output path:
+
+```powershell
+python src\pdf_cache_tool.py build "input\book.pdf" --pages "1-5,8,12" -o "work\book.pdfcache"
+```
+
+Optionally store rendered PNG pages inside the same cache. `images` renders pages containing PDF image objects; `all` renders every selected page. This can substantially increase cache size.
+
+```powershell
+python src\pdf_cache_tool.py build "input\book.pdf" --render-pages images --render-dpi 120
+```
+
+Inspect and validate a cache:
+
+```powershell
+python src\pdf_cache_tool.py inspect "extraction-cache\book.pdfcache" --page 31
+python src\pdf_cache_tool.py validate "extraction-cache\book.pdfcache" --pdf "input\book.pdf"
+```
+
+Export only the cached logical text when needed:
+
+```powershell
+python src\pdf_cache_tool.py export-text "extraction-cache\book.pdfcache" -o "work\book.txt"
+```
+
+The integration API is intentionally small: `PdfExtractionCache.get_page()`, `iter_pages()`, `get_rendered_page()`, and `load_cached_pages()`. Other reader components can consume those records without changing the cache file format.
+
+The reader integration currently rebuilds paragraphs, tables, captions, glossary links, and reading order from cached raw records on every conversion. This allows improvements to those algorithms without rescanning the PDF. When a cache contains a rendered page at 120 DPI or higher, image crops also reuse that render; otherwise the reader renders the image page from the source PDF as before.
+
 ## Development Checks
 
 ```powershell
 python -m py_compile src\pdf_reader_tool.py
+python -m py_compile src\pdf_cache_tool.py
+python tests\cache_tool_test.py
 python tests\smoke_test.py
 python tests\book_layout_regression_test.py
 ```

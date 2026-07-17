@@ -3,32 +3,38 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import hashlib
 import html
 import io
 import json
-import os
+import math
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
 import pdfplumber
 from PIL import Image
 from pypdf import PdfReader
 
+import pdf_cache_tool as extraction_cache
 
-APP_DIR = Path(__file__).resolve().parent
+
 PROJECT_DIR = APP_DIR.parent
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "generated-readers"
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
-BUNDLED_PDFTOPPM = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "native" / "poppler" / "Library" / "bin" / "pdftoppm.exe"
-PDFTOPPM = Path(os.environ["PDFTOPPM_PATH"]) if os.environ.get("PDFTOPPM_PATH") else Path(shutil.which("pdftoppm") or BUNDLED_PDFTOPPM)
+BUNDLED_PDFTOPPM = extraction_cache.BUNDLED_PDFTOPPM
+PDFTOPPM = extraction_cache.resolve_pdftoppm()
 IMAGE_RENDER_DPI = 120
 IMAGE_MAX_EMBED_WIDTH = 900
 IMAGE_JPEG_QUALITY = 84
@@ -273,16 +279,182 @@ def has_hebrew(value: str) -> bool:
     return bool(re.search(r"[\u0590-\u05ff]", value))
 
 
+def token_direction(value: str) -> str:
+    rtl_count = 0
+    ltr_count = 0
+    for character in value:
+        bidi_class = unicodedata.bidirectional(character)
+        if bidi_class in {"R", "AL"}:
+            rtl_count += 1
+        elif bidi_class in {"L", "EN", "AN"}:
+            ltr_count += 1
+    if rtl_count and ltr_count:
+        return "mixed"
+    if rtl_count:
+        return "rtl"
+    if ltr_count:
+        return "ltr"
+    return "neutral"
+
+
+def base_direction_for_words(words: list[dict]) -> str:
+    rtl_count = 0
+    ltr_count = 0
+    for word in words:
+        direction = str(word.get("direction") or token_direction(str(word.get("logical_text") or word.get("text") or "")))
+        if direction in {"rtl", "mixed"}:
+            rtl_count += 1
+        if direction in {"ltr", "mixed"}:
+            ltr_count += 1
+    if rtl_count:
+        return "rtl" if rtl_count >= ltr_count else "ltr"
+    return "ltr" if ltr_count else "neutral"
+
+
 def visual_word_to_text(value: str) -> str:
     if has_hebrew(value):
         return value[::-1]
     return value
 
 
+def comparable_word_characters(value: str) -> list[str]:
+    return sorted(
+        character.lower()
+        for character in value
+        if not character.isspace()
+    )
+
+
+def enrich_words_with_character_order(words: list[dict], chars: list[dict] | None) -> list[dict]:
+    if not words:
+        return []
+    chars = chars or []
+    bucket_size = 8.0
+    char_buckets: dict[int, list[tuple[int, dict]]] = {}
+    for index, character in enumerate(chars):
+        top = float(character.get("top") or 0.0)
+        bottom = float(character.get("bottom") or top)
+        bucket = int(((top + bottom) / 2.0) // bucket_size)
+        char_buckets.setdefault(bucket, []).append((index, character))
+
+    enriched: list[dict] = []
+    for visual_index, original_word in enumerate(words):
+        word = dict(original_word)
+        raw_text = str(word.get("text") or "")
+        direction = token_direction(raw_text)
+        x0 = float(word.get("x0") or 0.0)
+        x1 = float(word.get("x1") or x0)
+        top = float(word.get("top") or 0.0)
+        bottom = float(word.get("bottom") or top)
+        first_bucket = int((top - 2.0) // bucket_size)
+        last_bucket = int((bottom + 2.0) // bucket_size)
+        nearby: dict[int, dict] = {}
+        for bucket in range(first_bucket, last_bucket + 1):
+            for char_index, character in char_buckets.get(bucket, []):
+                nearby[char_index] = character
+
+        matching_chars: list[dict] = []
+        for character in nearby.values():
+            text = str(character.get("text") or "")
+            if not text or text.isspace():
+                continue
+            char_x0 = float(character.get("x0") or 0.0)
+            char_x1 = float(character.get("x1") or char_x0)
+            char_top = float(character.get("top") or 0.0)
+            char_bottom = float(character.get("bottom") or char_top)
+            char_mid_x = (char_x0 + char_x1) / 2.0
+            vertical_overlap = max(0.0, min(bottom, char_bottom) - max(top, char_top))
+            char_height = max(1.0, char_bottom - char_top)
+            if x0 - 0.35 <= char_mid_x <= x1 + 0.35 and vertical_overlap / char_height >= 0.42:
+                matching_chars.append(character)
+
+        if direction in {"rtl", "mixed"}:
+            ordered_chars = sorted(
+                matching_chars,
+                key=lambda item: (float(item.get("x0") or 0.0), -float(item.get("top") or 0.0)),
+                reverse=True,
+            )
+        else:
+            ordered_chars = sorted(
+                matching_chars,
+                key=lambda item: (float(item.get("x0") or 0.0), float(item.get("top") or 0.0)),
+            )
+        character_text = "".join(str(character.get("text") or "") for character in ordered_chars).strip()
+        character_matches_word = bool(character_text) and (
+            comparable_word_characters(character_text) == comparable_word_characters(raw_text)
+        )
+
+        if character_matches_word:
+            logical_text = character_text
+            order_source = (
+                "word_extractor_confirmed"
+                if normalize_text_spacing(character_text) == normalize_text_spacing(raw_text)
+                else "character_geometry"
+            )
+            distinct_positions = len({round(float(character.get("x0") or 0.0), 2) for character in matching_chars})
+            order_confidence = 0.97 if distinct_positions >= max(2, len(matching_chars) - 1) else 0.84
+        else:
+            logical_text = visual_word_to_text(raw_text)
+            order_source = "word_extractor_fallback"
+            order_confidence = 0.72 if raw_text else 0.0
+
+        word["raw_text"] = raw_text
+        word["logical_text"] = normalize_text_spacing(logical_text)
+        word["direction"] = token_direction(word["logical_text"] or raw_text)
+        word["order_source"] = order_source
+        word["order_confidence"] = order_confidence
+        word["character_count"] = len(matching_chars)
+        word["visual_index"] = visual_index
+        enriched.append(word)
+    return enriched
+
+
 def visual_line_to_text(value: str) -> str:
     if has_hebrew(value):
         return value[::-1]
     return value
+
+
+def visual_style_words_to_logical_text(visual_line: dict) -> str:
+    """Rebuild RTL word order while preserving the internal order of LTR runs."""
+    words = [str(word.get("text") or "").strip() for word in visual_line.get("style_words", [])]
+    words = [word for word in words if word]
+    if not words:
+        return clean_extracted_text_line(visual_line_to_text(str(visual_line.get("text") or "")))
+
+    if str(visual_line.get("base_direction") or "") == "ltr":
+        return clean_extracted_text_line(normalize_text_spacing(" ".join(words)))
+
+    result: list[str] = []
+    index = 0
+    while index < len(words):
+        if has_hebrew(words[index]):
+            result.append(words[index])
+            index += 1
+            continue
+        run: list[str] = []
+        while index < len(words) and not has_hebrew(words[index]):
+            run.append(words[index])
+            index += 1
+        if not any(re.search(r"[A-Za-z0-9]", token) for token in run):
+            result.extend(run)
+        else:
+            result.extend(token.translate(str.maketrans("()", ")(")) for token in reversed(run))
+    return clean_extracted_text_line(normalize_text_spacing(" ".join(result)))
+
+
+def mixed_order_token_overlap(first: str, second: str) -> float:
+    first_tokens = re.findall(r"[A-Za-z0-9]+|[\u0590-\u05ff]+", first.lower())
+    second_tokens = re.findall(r"[A-Za-z0-9]+|[\u0590-\u05ff]+", second.lower())
+    if not first_tokens or not second_tokens:
+        return 0.0
+    remaining = list(second_tokens)
+    matches = 0
+    for token in first_tokens:
+        if token in remaining:
+            remaining.remove(token)
+            matches += 1
+    return matches / max(len(first_tokens), len(second_tokens))
 
 
 def canonical_match_text(value: str) -> str:
@@ -303,6 +475,11 @@ def style_line_similarity(correct_text: str, visual_line: dict) -> float:
         return 0.0
     if correct == visual:
         return 1.0
+    if has_hebrew(correct_text) and re.search(r"[A-Za-z0-9]", correct_text):
+        mixed_visual_text = visual_style_words_to_logical_text(visual_line)
+        token_overlap = mixed_order_token_overlap(correct_text, mixed_visual_text)
+        if token_overlap >= 0.86:
+            return max(0.88, token_overlap * 0.96)
     if correct in visual or visual in correct:
         shorter = min(len(correct), len(visual))
         longer = max(len(correct), len(visual))
@@ -342,6 +519,11 @@ def line_debug_record(line: dict, index: int | None = None, role: str | None = N
         "width": round(line_width(line), 2),
         "size": round(float(line.get("size") or 0.0), 2),
         "font": str(line.get("font") or ""),
+        "turquoise_ratio": round(float(line.get("turquoise_ratio") or 0.0), 3),
+        "turquoise_text": str(line.get("turquoise_text") or ""),
+        "base_direction": str(line.get("base_direction") or ""),
+        "word_order_source": str(line.get("word_order_source") or ""),
+        "word_order_confidence": round(float(line.get("word_order_confidence") or 0.0), 3),
     }
     if index is not None:
         record["index"] = index
@@ -349,36 +531,164 @@ def line_debug_record(line: dict, index: int | None = None, role: str | None = N
         record["role"] = role
     if line.get("noise_reason"):
         record["noise_reason"] = str(line.get("noise_reason"))
+    if line.get("text_source"):
+        record["text_source"] = str(line.get("text_source"))
+    if line.get("alignment_reason"):
+        record["alignment_reason"] = str(line.get("alignment_reason"))
+    if line.get("alignment_score") is not None:
+        record["alignment_score"] = round(float(line.get("alignment_score") or 0.0), 3)
+    if line.get("logical_index") is not None:
+        record["logical_index"] = int(line.get("logical_index"))
+    if line.get("style_words"):
+        record["token_order"] = [
+            {
+                "text": str(word.get("text") or ""),
+                "direction": str(word.get("direction") or ""),
+                "x0": round(float(word.get("x0") or 0.0), 2),
+                "x1": round(float(word.get("x1") or 0.0), 2),
+                "order_source": str(word.get("order_source") or ""),
+                "order_confidence": round(float(word.get("order_confidence") or 0.0), 3),
+            }
+            for word in line.get("style_words", [])
+        ]
     return record
+
+
+def line_reading_sort_key(line: dict) -> tuple[int, float, float]:
+    top = float(line.get("top") or 0.0)
+    base_direction = str(line.get("base_direction") or "")
+    horizontal = -float(line.get("x1") or 0.0) if base_direction == "rtl" else float(line.get("x0") or 0.0)
+    return round(top / 3.2), horizontal, top
+
+
+def monotonic_line_matches(clean_text_lines: list[str], visual_lines: list[dict]) -> dict[int, tuple[int, float]]:
+    """Return a maximum-score, order-preserving logical-to-visual line match."""
+    text_count = len(clean_text_lines)
+    visual_count = len(visual_lines)
+    scores = [
+        [style_line_similarity(text, visual_line) for visual_line in visual_lines]
+        for text in clean_text_lines
+    ]
+    states: list[list[tuple[float, int]]] = [
+        [(0.0, 0) for _ in range(visual_count + 1)]
+        for _ in range(text_count + 1)
+    ]
+    actions: list[list[str]] = [
+        ["" for _ in range(visual_count + 1)]
+        for _ in range(text_count + 1)
+    ]
+
+    for text_index in range(1, text_count + 1):
+        actions[text_index][0] = "skip_text"
+    for visual_index in range(1, visual_count + 1):
+        actions[0][visual_index] = "skip_visual"
+
+    for text_index in range(1, text_count + 1):
+        for visual_index in range(1, visual_count + 1):
+            best = states[text_index - 1][visual_index]
+            action = "skip_text"
+            skip_visual = states[text_index][visual_index - 1]
+            if skip_visual > best:
+                best = skip_visual
+                action = "skip_visual"
+            score = scores[text_index - 1][visual_index - 1]
+            if score >= 0.58:
+                previous = states[text_index - 1][visual_index - 1]
+                match = (previous[0] + score - 0.53, previous[1] + 1)
+                if match > best:
+                    best = match
+                    action = "match"
+            states[text_index][visual_index] = best
+            actions[text_index][visual_index] = action
+
+    matches: dict[int, tuple[int, float]] = {}
+    text_index = text_count
+    visual_index = visual_count
+    while text_index > 0 or visual_index > 0:
+        action = actions[text_index][visual_index]
+        if action == "match":
+            matches[text_index - 1] = (visual_index - 1, scores[text_index - 1][visual_index - 1])
+            text_index -= 1
+            visual_index -= 1
+        elif action == "skip_text":
+            text_index -= 1
+        elif action == "skip_visual":
+            visual_index -= 1
+        elif text_index > 0:
+            text_index -= 1
+        else:
+            visual_index -= 1
+    return matches
 
 
 def align_text_lines_to_style_lines(correct_text_lines: list[str], visual_lines: list[dict], require_visual_match: bool = False) -> list[dict]:
     corrected_lines: list[dict | None] = [None] * len(correct_text_lines)
     clean_text_lines = [clean_extracted_text_line(line) for line in correct_text_lines]
-    candidates: list[tuple[float, int, int]] = []
-    for text_index, clean_text in enumerate(clean_text_lines):
-        for visual_index, visual_line in enumerate(visual_lines):
-            score = style_line_similarity(clean_text, visual_line)
-            if score >= 0.58:
-                candidates.append((score, text_index, visual_index))
-
-    def candidate_sort_key(item: tuple[float, int, int]) -> tuple[float, int]:
-        score, text_index, visual_index = item
-        correct_length = len(canonical_match_text(clean_text_lines[text_index]))
-        visual_length = len(canonical_match_text(visual_line_to_text(str(visual_lines[visual_index].get("text", "")))))
-        return score, min(correct_length, visual_length)
-
-    candidates.sort(key=candidate_sort_key, reverse=True)
-
-    used_text_indexes: set[int] = set()
+    ordered_visual_lines = sorted(visual_lines, key=line_reading_sort_key)
+    matches = monotonic_line_matches(clean_text_lines, ordered_visual_lines)
     used_visual_indexes: set[int] = set()
-    for score, text_index, visual_index in candidates:
-        if text_index in used_text_indexes or visual_index in used_visual_indexes:
+
+    def matched_line(text_index: int, visual_index: int, score: float, reason: str) -> dict:
+        line = dict(ordered_visual_lines[visual_index])
+        logical_text = clean_text_lines[text_index]
+        if has_hebrew(logical_text) and re.search(r"[A-Za-z0-9]", logical_text):
+            visual_order_text = visual_style_words_to_logical_text(line)
+            order_similarity = difflib.SequenceMatcher(
+                None,
+                canonical_match_text(logical_text),
+                canonical_match_text(visual_order_text),
+            ).ratio()
+            if mixed_order_token_overlap(logical_text, visual_order_text) >= 0.86 and order_similarity < 0.78:
+                logical_text = visual_order_text
+                line["text_source"] = "visual_mixed_order"
+        line["text"] = logical_text
+        line.setdefault("text_source", "logical_text")
+        line["logical_index"] = text_index
+        line["alignment_score"] = round(score, 3)
+        line["alignment_reason"] = reason
+        return line
+
+    for text_index, (visual_index, score) in matches.items():
+        corrected_lines[text_index] = matched_line(
+            text_index,
+            visual_index,
+            score,
+            "monotonic_text_geometry",
+        )
+        used_visual_indexes.add(visual_index)
+
+    # Logical extractors often interleave margin notes differently from the
+    # page geometry. Recover only strong one-to-one matches after the monotonic
+    # body pass so side captions keep their real coordinates without allowing
+    # weak, repeated body lines to cross-match.
+    recovery_candidates: list[tuple[float, int, int]] = []
+    for text_index, clean_text in enumerate(clean_text_lines):
+        if corrected_lines[text_index] is not None:
             continue
-        line = dict(visual_lines[visual_index])
-        line["text"] = clean_text_lines[text_index]
-        corrected_lines[text_index] = line
-        used_text_indexes.add(text_index)
+        for visual_index, visual_line in enumerate(ordered_visual_lines):
+            if visual_index in used_visual_indexes:
+                continue
+            score = style_line_similarity(clean_text, visual_line)
+            if score >= 0.84:
+                recovery_candidates.append((score, text_index, visual_index))
+    recovery_candidates.sort(
+        key=lambda item: (
+            item[0],
+            len(canonical_match_text(clean_text_lines[item[1]])),
+        ),
+        reverse=True,
+    )
+    recovered_text_indexes: set[int] = set()
+    for score, text_index, visual_index in recovery_candidates:
+        if text_index in recovered_text_indexes or visual_index in used_visual_indexes:
+            continue
+        corrected_lines[text_index] = matched_line(
+            text_index,
+            visual_index,
+            score,
+            "high_confidence_geometry_recovery",
+        )
+        recovered_text_indexes.add(text_index)
         used_visual_indexes.add(visual_index)
 
     last_top = 0.0
@@ -390,10 +700,12 @@ def align_text_lines_to_style_lines(correct_text_lines: list[str], visual_lines:
         if require_visual_match:
             continue
 
-        if index < len(visual_lines) and index not in used_visual_indexes:
-            line = dict(visual_lines[index])
+        if index < len(ordered_visual_lines) and index not in used_visual_indexes:
+            line = dict(ordered_visual_lines[index])
             used_visual_indexes.add(index)
             last_top = max(last_top, float(line.get("bottom") or line.get("top") or last_top))
+            line["alignment_reason"] = "visual_index_fallback"
+            line["alignment_score"] = 0.0
         else:
             top = last_top + 18.0
             line = {
@@ -406,12 +718,16 @@ def align_text_lines_to_style_lines(correct_text_lines: list[str], visual_lines:
                 "style_words": [],
             }
             last_top = line["bottom"]
+            line["alignment_reason"] = "synthetic_logical_fallback"
+            line["alignment_score"] = 0.0
 
         line["text"] = clean_text
+        line["text_source"] = "logical_text"
+        line["logical_index"] = index
         corrected_lines[index] = line
 
     complete_lines = [line for line in corrected_lines if line is not None]
-    complete_lines.sort(key=lambda line: (float(line.get("top") or 0), float(line.get("x0") or 0)))
+    complete_lines.sort(key=line_reading_sort_key)
     return complete_lines
 
 
@@ -419,10 +735,54 @@ def visual_lines_to_text_lines(visual_lines: list[dict]) -> list[dict]:
     corrected: list[dict] = []
     for visual_line in visual_lines:
         line = dict(visual_line)
-        line["text"] = clean_extracted_text_line(visual_line_to_text(str(line.get("text") or "")))
+        line["text"] = visual_style_words_to_logical_text(line)
+        line["text_source"] = "visual_character_order"
+        line["alignment_reason"] = "visual_only"
+        line["alignment_score"] = 0.0
         corrected.append(line)
-    corrected.sort(key=lambda line: (float(line.get("top") or 0), float(line.get("x0") or 0)))
+    corrected.sort(key=line_reading_sort_key)
     return corrected
+
+
+def normalize_pdf_color(value: object) -> tuple[float, ...]:
+    """Return a stable 0..1 tuple for pdfplumber color values."""
+    if value is None:
+        return ()
+    if isinstance(value, (int, float)):
+        component = min(max(float(value), 0.0), 1.0)
+        return (component, component, component)
+    if not isinstance(value, (list, tuple)):
+        return ()
+    try:
+        components = tuple(min(max(float(component), 0.0), 1.0) for component in value)
+    except (TypeError, ValueError):
+        return ()
+    if len(components) == 1:
+        return components * 3
+    if len(components) == 4:
+        cyan, magenta, yellow, black = components
+        return (
+            (1.0 - cyan) * (1.0 - black),
+            (1.0 - magenta) * (1.0 - black),
+            (1.0 - yellow) * (1.0 - black),
+        )
+    return components[:3]
+
+
+def is_turquoise_color(value: object) -> bool:
+    """Recognize the book's teal/turquoise accent without treating location as meaning."""
+    color = normalize_pdf_color(value)
+    if len(color) != 3:
+        return False
+    red, green, blue = color
+    return (
+        green >= 0.34
+        and blue >= 0.30
+        and red <= 0.42
+        and green - red >= 0.14
+        and blue - red >= 0.12
+        and abs(green - blue) <= 0.28
+    )
 
 
 def line_from_words(words: list[dict]) -> dict:
@@ -434,7 +794,25 @@ def line_from_words(words: list[dict]) -> dict:
     bottom = max(float(word.get("bottom") or top) for word in words)
     x0 = min(float(word.get("x0") or 0) for word in words)
     x1 = max(float(word.get("x1") or x0) for word in words)
-    reading_words = list(reversed(words))
+    base_direction = base_direction_for_words(words)
+    reading_words = list(reversed(words)) if base_direction == "rtl" else list(words)
+    style_words = [
+        {
+            "text": normalize_text_spacing(str(word.get("logical_text") or visual_word_to_text(str(word.get("text", ""))))),
+            "size": float(word.get("size") or 0),
+            "font": str(word.get("fontname") or ""),
+            "color": normalize_pdf_color(word.get("non_stroking_color")),
+            "x0": float(word.get("x0") or 0.0),
+            "x1": float(word.get("x1") or word.get("x0") or 0.0),
+            "direction": str(word.get("direction") or token_direction(str(word.get("text") or ""))),
+            "order_source": str(word.get("order_source") or "word_extractor_fallback"),
+            "order_confidence": float(word.get("order_confidence") or 0.0),
+            "character_count": int(word.get("character_count") or 0),
+            "visual_index": int(word.get("visual_index") or 0),
+        }
+        for word in reading_words
+    ]
+    colored_words = [word for word in style_words if is_turquoise_color(word.get("color"))]
     return {
         "text": text,
         "raw_text": raw_text,
@@ -444,14 +822,14 @@ def line_from_words(words: list[dict]) -> dict:
         "bottom": bottom,
         "x0": x0,
         "x1": x1,
-        "style_words": [
-            {
-                "text": normalize_text_spacing(visual_word_to_text(str(word.get("text", "")))),
-                "size": float(word.get("size") or 0),
-                "font": str(word.get("fontname") or ""),
-            }
-            for word in reading_words
-        ],
+        "base_direction": base_direction,
+        "word_order_source": "rtl_spatial" if base_direction == "rtl" else "ltr_spatial",
+        "word_order_confidence": min(
+            [float(word.get("order_confidence") or 0.0) for word in reading_words] or [0.0]
+        ),
+        "style_words": style_words,
+        "turquoise_ratio": len(colored_words) / max(1, len(style_words)),
+        "turquoise_text": normalize_text_spacing(" ".join(str(word.get("text") or "") for word in colored_words)),
     }
 
 
@@ -524,6 +902,31 @@ def style_attrs(size: float, font: str, body_size: float) -> tuple[list[str], st
 LTR_SEQUENCE_RE = re.compile(r"\(?[A-Za-z0-9][A-Za-z0-9\s.,;:&'\"()\-–/]*[A-Za-z0-9)&]\)?")
 
 
+RESEARCH_CITATION_YEAR_RE = re.compile(r"(?<!\d)(?:1[5-9]|20)\d{2}(?!\d)")
+
+
+def is_parenthetical_research_citation(value: str) -> bool:
+    candidate = value.strip()
+    return bool(
+        candidate.startswith("(")
+        and candidate.endswith(")")
+        and RESEARCH_CITATION_YEAR_RE.search(candidate)
+        and re.search(r"[A-Za-z]{2,}", candidate)
+    )
+
+
+def research_citation_html(value: str) -> str:
+    escaped_value = html.escape(value)
+    aria_label = html.escape(f"Research citation: {value[1:-1]}", quote=True)
+    return (
+        '<span class="research-citation" dir="ltr">'
+        f'<button type="button" class="citation-marker" aria-expanded="false" '
+        f'aria-label="{aria_label}">ⓘ</button>'
+        f'<span class="citation-popover" role="tooltip"><bdi dir="ltr">{escaped_value}</bdi></span>'
+        '</span>'
+    )
+
+
 def text_with_bidi_isolates(value: str) -> str:
     parts: list[str] = []
     last = 0
@@ -531,7 +934,11 @@ def text_with_bidi_isolates(value: str) -> str:
         start, end = match.span()
         if start > last:
             parts.append(html.escape(value[last:start]))
-        parts.append(f'<bdi dir="ltr">{html.escape(match.group(0))}</bdi>')
+        matched_value = match.group(0)
+        if is_parenthetical_research_citation(matched_value):
+            parts.append(research_citation_html(matched_value))
+        else:
+            parts.append(f'<bdi dir="ltr">{html.escape(matched_value)}</bdi>')
         last = end
     if last < len(value):
         parts.append(html.escape(value[last:]))
@@ -548,7 +955,12 @@ def styled_line_html(line: dict, body_size: float) -> str:
     line_classes, line_style = style_attrs(line["size"], line["font"], body_size)
     style_words = [
         word for word in line.get("style_words", [])
-        if word.get("text") and (is_bold_font(word.get("font", "")) or is_italic_font(word.get("font", "")) or abs((float(word.get("size") or 0) / body_size) - 1.0) >= 0.06)
+        if word.get("text") and (
+            is_bold_font(word.get("font", ""))
+            or is_italic_font(word.get("font", ""))
+            or is_turquoise_color(word.get("color"))
+            or abs((float(word.get("size") or 0) / body_size) - 1.0) >= 0.06
+        )
     ]
 
     if not style_words:
@@ -566,6 +978,8 @@ def styled_line_html(line: dict, body_size: float) -> str:
         if position == -1:
             continue
         classes, style_attr = style_attrs(float(word.get("size") or 0), str(word.get("font") or ""), body_size)
+        if is_turquoise_color(word.get("color")):
+            classes.append("term-accent")
         ranges.append((position, position + len(token), classes, style_attr))
         cursor = position + len(token)
 
@@ -818,7 +1232,7 @@ def is_likely_secondary_line(line: dict, body_size: float, page_width: float, bo
     looks_like_heading = size >= body_size * 1.06 or is_bold_font(str(line.get("font") or ""))
 
     if looks_like_heading:
-        return False
+        return outside_body and narrow and short
     if not outside_body and is_ltr_reference_fragment(text):
         return False
 
@@ -934,6 +1348,267 @@ def separate_secondary_text(lines: list[dict], body_size: float, page_width: flo
         else:
             flow_lines.append(line)
     return flow_lines, secondary_lines_to_blocks(secondary_lines, body_size)
+
+
+def turquoise_term_similarity(note_text: str, body_text: str) -> float:
+    note_hebrew = canonical_hebrew_text(note_text)
+    body_hebrew = canonical_hebrew_text(body_text)
+    if len(note_hebrew) >= 3 and note_hebrew == body_hebrew:
+        return 1.0
+    if len(note_hebrew) >= 8 and len(body_hebrew) >= 8:
+        if note_hebrew in body_hebrew or body_hebrew in note_hebrew:
+            return min(len(note_hebrew), len(body_hebrew)) / max(len(note_hebrew), len(body_hebrew))
+        return difflib.SequenceMatcher(None, note_hebrew, body_hebrew).ratio()
+    note = canonical_match_text(note_text)
+    body = canonical_match_text(body_text)
+    if len(note) < 8 or len(body) < 8:
+        return 0.0
+    return difflib.SequenceMatcher(None, note, body).ratio()
+
+
+def group_turquoise_note_lines(lines: list[dict], body_size: float, page_width: float) -> list[list[dict]]:
+    if not lines:
+        return []
+    groups: list[list[dict]] = []
+    max_gap = max(body_size * 1.55, 10.0)
+    for line in sorted(lines, key=lambda item: (float(item.get("top") or 0.0), float(item.get("x0") or 0.0))):
+        match = None
+        for group in reversed(groups):
+            previous = group[-1]
+            vertical_gap = float(line.get("top") or 0.0) - float(previous.get("bottom") or 0.0)
+            horizontal_overlap = min(float(line.get("x1") or 0.0), float(previous.get("x1") or 0.0)) - max(float(line.get("x0") or 0.0), float(previous.get("x0") or 0.0))
+            centers_close = abs(
+                (float(line.get("x0") or 0.0) + float(line.get("x1") or 0.0)) / 2.0
+                - (float(previous.get("x0") or 0.0) + float(previous.get("x1") or 0.0)) / 2.0
+            ) <= page_width * 0.13
+            if 0.0 <= vertical_gap <= max_gap and (horizontal_overlap >= 0.0 or centers_close):
+                match = group
+                break
+        if match is None:
+            groups.append([line])
+        else:
+            match.append(line)
+    return groups
+
+
+def glossary_signal_words(line: dict) -> list[dict]:
+    return [
+        word
+        for word in line.get("style_words", [])
+        if str(word.get("text") or "").strip()
+        and (is_bold_font(str(word.get("font") or "")) or is_turquoise_color(word.get("color")))
+    ]
+
+
+def glossary_signal_text(line: dict) -> str:
+    turquoise_text = normalize_text_spacing(str(line.get("turquoise_text") or ""))
+    if turquoise_text:
+        return turquoise_text
+    words = glossary_signal_words(line)
+    if words:
+        return normalize_text_spacing(" ".join(str(word.get("text") or "") for word in words))
+    return ""
+
+
+def glossary_visual_line_text(line: dict) -> str:
+    """Build readable text for a visually separate RTL term and its LTR translation."""
+    words = [word for word in line.get("style_words", []) if str(word.get("text") or "").strip()]
+    if not words:
+        return visual_style_words_to_logical_text(line)
+    hebrew_words = [str(word.get("text") or "").strip() for word in words if has_hebrew(str(word.get("text") or ""))]
+    ltr_words = sorted(
+        [word for word in words if re.search(r"[A-Za-z0-9]", str(word.get("text") or ""))],
+        key=lambda word: float(word.get("x0") or 0.0),
+    )
+    hebrew_text = normalize_text_spacing(" ".join(hebrew_words))
+    ltr_text = normalize_text_spacing(" ".join(str(word.get("text") or "") for word in ltr_words))
+    if hebrew_text and ltr_text:
+        return f"{hebrew_text} ({ltr_text})"
+    if hebrew_text:
+        return hebrew_text
+    if ltr_text:
+        raw_text = str(line.get("raw_text") or line.get("text") or "")
+        return f"({ltr_text})" if "(" in raw_text or ")" in raw_text else ltr_text
+    return visual_style_words_to_logical_text(line)
+
+
+def same_line_geometry(first: dict, second: dict) -> bool:
+    top_close = abs(float(first.get("top") or 0.0) - float(second.get("top") or 0.0)) <= 2.5
+    first_width = max(1.0, line_width(first))
+    second_width = max(1.0, line_width(second))
+    overlap = max(
+        0.0,
+        min(float(first.get("x1") or 0.0), float(second.get("x1") or 0.0))
+        - max(float(first.get("x0") or 0.0), float(second.get("x0") or 0.0)),
+    )
+    return top_close and overlap / min(first_width, second_width) >= 0.72
+
+
+def visual_margin_glossary_candidates(
+    visual_lines: list[dict],
+    corrected_lines: list[dict],
+    body_band: tuple[float, float],
+) -> list[dict]:
+    body_left, body_right = body_band
+    candidates: list[dict] = []
+    for visual_line in visual_lines:
+        center = (float(visual_line.get("x0") or 0.0) + float(visual_line.get("x1") or 0.0)) / 2.0
+        if body_left <= center <= body_right:
+            continue
+        signal_text = glossary_signal_text(visual_line)
+        has_bold = any(is_bold_font(str(word.get("font") or "")) for word in visual_line.get("style_words", []))
+        has_accent = float(visual_line.get("turquoise_ratio") or 0.0) > 0.0
+        word_count = len(re.findall(r"[A-Za-z0-9]+|[\u0590-\u05ff]+", glossary_visual_line_text(visual_line)))
+        if not signal_text or not (has_bold or has_accent) or not 1 <= word_count <= 12:
+            continue
+        if any(same_line_geometry(visual_line, line) for line in corrected_lines):
+            continue
+        candidate = dict(visual_line)
+        candidate["text"] = glossary_visual_line_text(visual_line)
+        candidate["glossary_source"] = "visual_margin"
+        candidates.append(candidate)
+    return candidates
+
+
+def remove_embedded_margin_term_duplicate(anchor: dict, candidate_lines: list[dict]) -> str:
+    """Remove a margin term appended to body text by the logical PDF layer."""
+    hebrew_signals = [
+        normalize_text_spacing(
+            " ".join(
+                str(word.get("text") or "")
+                for word in glossary_signal_words(line)
+                if has_hebrew(str(word.get("text") or ""))
+            )
+        )
+        for line in candidate_lines
+    ]
+    primary = normalize_text_spacing(" ".join(signal for signal in hebrew_signals if signal))
+    text = str(anchor.get("text") or "")
+    if not primary or text.count(primary) < 2:
+        return ""
+    duplicate_start = text.rfind(primary)
+    if duplicate_start < max(1, int(len(text) * 0.45)):
+        return ""
+    duplicate = text[duplicate_start:].strip()
+    ltr_tokens = [
+        str(word.get("text") or "").strip().lower()
+        for line in candidate_lines
+        for word in line.get("style_words", [])
+        if re.search(r"[A-Za-z0-9]", str(word.get("text") or ""))
+    ]
+    if ltr_tokens and not all(token in duplicate.lower() for token in ltr_tokens):
+        return ""
+    repaired = text[:duplicate_start].rstrip(" ,;:-")
+    if not repaired:
+        return ""
+    anchor["text"] = repaired
+    anchor["glossary_duplicate_removed"] = duplicate
+    return duplicate
+
+
+def extract_glossary_terms(
+    lines: list[dict],
+    body_size: float,
+    page_width: float,
+    visual_lines: list[dict] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Extract linked term notes; outer-margin position alone is never sufficient."""
+    if not lines or page_width <= 0:
+        return lines, []
+    body_band = estimate_body_band(lines, body_size, page_width)
+    body_left, body_right = body_band
+    signal_lines = [
+        line for line in lines
+        if len(canonical_match_text(glossary_signal_text(line))) >= 3
+    ]
+    body_signal_lines = [
+        line for line in signal_lines
+        if (float(line.get("x0") or 0.0) + float(line.get("x1") or 0.0)) / 2.0 >= body_left
+        and (float(line.get("x0") or 0.0) + float(line.get("x1") or 0.0)) / 2.0 <= body_right
+    ]
+    external_signal_lines = [line for line in signal_lines if line not in body_signal_lines]
+    external_signal_lines.extend(
+        visual_margin_glossary_candidates(visual_lines or [], lines, body_band)
+    )
+    terms: list[dict] = []
+    consumed_line_ids: set[int] = set()
+    for candidate_lines in group_turquoise_note_lines(external_signal_lines, body_size, page_width):
+        candidate_text = normalize_text_spacing(" ".join(str(line.get("text") or "") for line in candidate_lines))
+        candidate_mid = (
+            min(float(line.get("top") or 0.0) for line in candidate_lines)
+            + max(float(line.get("bottom") or 0.0) for line in candidate_lines)
+        ) / 2.0
+        best: tuple[float, float, dict] | None = None
+        for body_line in body_signal_lines:
+            body_text = glossary_signal_text(body_line)
+            similarity = turquoise_term_similarity(candidate_text, body_text)
+            distance = abs(candidate_mid - (float(body_line.get("top") or 0.0) + float(body_line.get("bottom") or 0.0)) / 2.0)
+            if distance > max(body_size * 24.0, 220.0):
+                continue
+            score = similarity - min(distance / max(body_size * 100.0, 900.0), 0.18)
+            if best is None or score > best[0]:
+                best = (score, similarity, body_line)
+        if best is None or best[1] < 0.68:
+            continue
+        _, similarity, anchor = best
+        x0 = min(float(line.get("x0") or 0.0) for line in candidate_lines)
+        x1 = max(float(line.get("x1") or 0.0) for line in candidate_lines)
+        side = "left" if (x0 + x1) / 2.0 < (body_left + body_right) / 2.0 else "right"
+        source = "visual_margin" if any(line.get("glossary_source") == "visual_margin" for line in candidate_lines) else "corrected_line"
+        duplicate_removed = remove_embedded_margin_term_duplicate(anchor, candidate_lines) if source == "visual_margin" else ""
+        term = {
+            "id": f"glossary-{len(terms) + 1}",
+            "kind": "glossary",
+            "text": candidate_text,
+            "html": "<br>".join(styled_line_html(line, body_size) for line in candidate_lines),
+            "lines": candidate_lines,
+            "top": min(float(line.get("top") or 0.0) for line in candidate_lines),
+            "bottom": max(float(line.get("bottom") or 0.0) for line in candidate_lines),
+            "x0": x0,
+            "x1": x1,
+            "side": side,
+            "anchor_top": float(anchor.get("top") or 0.0),
+            "body_term_text": glossary_signal_text(anchor),
+            "match_confidence": round(similarity, 3),
+            "match_reason": "bold_margin_semantic_duplicate" if source == "visual_margin" else "turquoise_semantic_duplicate",
+            "source": source,
+            "duplicate_removed": duplicate_removed,
+        }
+        terms.append(term)
+        consumed_line_ids.update(id(line) for line in candidate_lines)
+    return [line for line in lines if id(line) not in consumed_line_ids], terms
+
+
+def attach_glossary_terms_to_body_blocks(body_blocks: list[dict], terms: list[dict]) -> None:
+    ordinary_blocks = [block for block in body_blocks if block.get("tag") == "p" and not block.get("class")]
+    for index, block in enumerate(ordinary_blocks, start=1):
+        block.setdefault("id", f"body-{index}")
+    for term in terms:
+        anchor_top = float(term.get("anchor_top") or term.get("top") or 0.0)
+        containing = [
+            block for block in ordinary_blocks
+            if float(block.get("top") or 0.0) - 1.0 <= anchor_top <= float(block.get("bottom") or 0.0) + 1.0
+        ]
+        candidates = containing or ordinary_blocks
+        if not candidates:
+            continue
+        block = min(
+            candidates,
+            key=lambda item: min(
+                abs(anchor_top - float(item.get("top") or 0.0)),
+                abs(anchor_top - float(item.get("bottom") or 0.0)),
+            ),
+        )
+        block.setdefault("glossary_terms", []).append(term)
+        term["linked_body_block_id"] = str(block.get("id") or "")
+        block_size = dominant_number(
+            [float(line.get("size") or 0.0) for line in block.get("lines", [])],
+            fallback=12.0,
+        )
+        term["block_offset_em"] = round(
+            max(0.0, anchor_top - float(block.get("top") or anchor_top)) / max(block_size, 1.0) * 1.25,
+            2,
+        )
 
 
 def is_question_callout_title(text: str) -> bool:
@@ -1110,6 +1785,7 @@ def table_region_record(table: dict, page_width: float, order: int) -> dict:
         "rows": int(table.get("rows") or 0),
         "cols": int(table.get("cols") or 0),
         "reconstructed": bool(table.get("reconstructed")),
+        "continuation": bool(table.get("continuation")),
     }
 
 
@@ -1706,7 +2382,7 @@ def validate_image_max_width(value: int) -> int:
 
 
 def image_crop_data_uri(
-    rendered_page_path: Path,
+    rendered_page: Path | bytes,
     page_width: float,
     page_height: float,
     source_box: list[float],
@@ -1714,7 +2390,8 @@ def image_crop_data_uri(
     quality: int = IMAGE_JPEG_QUALITY,
     max_width: int = IMAGE_MAX_EMBED_WIDTH,
 ) -> str:
-    with Image.open(rendered_page_path) as rendered:
+    image_source = io.BytesIO(rendered_page) if isinstance(rendered_page, bytes) else rendered_page
+    with Image.open(image_source) as rendered:
         scale_x = rendered.width / max(1.0, page_width)
         scale_y = rendered.height / max(1.0, page_height)
         x0, top, x1, bottom = [float(value) for value in source_box]
@@ -1737,6 +2414,7 @@ def embed_page_images(
     *,
     quality: int = IMAGE_JPEG_QUALITY,
     max_width: int = IMAGE_MAX_EMBED_WIDTH,
+    page_cache: extraction_cache.PdfExtractionCache | None = None,
     progress_callback=None,
 ) -> None:
     quality = validate_image_quality(quality)
@@ -1747,9 +2425,23 @@ def embed_page_images(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         for page_index, page in enumerate(pages_with_images, start=1):
+            page_number = int(page["number"])
+            rendered_page: Path | bytes | None = None
+            if page_cache is not None:
+                render_info = page_cache.rendered_page_info(page_number)
+                if render_info and int(render_info.get("dpi") or 0) >= IMAGE_RENDER_DPI:
+                    try:
+                        rendered_page = page_cache.get_rendered_page(page_number)
+                    except (KeyError, extraction_cache.CacheError):
+                        rendered_page = None
             if progress_callback:
-                progress_callback(f"Rendering images for page {page['number']} ({page_index}/{len(pages_with_images)})")
-            rendered_page = render_pdf_page_to_png(pdf_path, int(page["number"]), tmp_path)
+                action = "Loading cached image render" if rendered_page is not None else "Rendering images"
+                progress_callback(f"{action} for page {page_number} ({page_index}/{len(pages_with_images)})")
+            if rendered_page is None:
+                rendered_page = render_pdf_page_to_png(pdf_path, page_number, tmp_path)
+                page["image_render_source"] = "pdf"
+            else:
+                page["image_render_source"] = "cache"
             for image in page.get("image_regions", []):
                 source_box = image.get("source_box")
                 if not source_box:
@@ -2080,19 +2772,300 @@ def reconstruct_table_from_matching_marker(marker_text: str, fallback_lines: lis
     return None
 
 
-def detect_tables(page: pdfplumber.page.Page, crop_bounds: tuple[float, float, float, float] | None = None) -> list[dict]:
-    detected: list[dict] = []
+def positioned_line_fragments(line: dict, body_size: float) -> list[dict]:
+    """Split a visual line at cell-sized horizontal gaps while preserving reading order."""
+    words = [
+        word for word in line.get("style_words", [])
+        if word.get("text") and word.get("x0") is not None and word.get("x1") is not None
+    ]
+    if not words:
+        return [dict(line)]
+
+    def make_fragment(logical_words: list[dict]) -> dict:
+        fragment = dict(line)
+        fragment["text"] = normalize_text_spacing(" ".join(str(word.get("text") or "") for word in logical_words))
+        fragment["x0"] = min(float(word.get("x0") or 0.0) for word in logical_words)
+        fragment["x1"] = max(float(word.get("x1") or 0.0) for word in logical_words)
+        fragment["style_words"] = logical_words
+        return fragment
+
+    if len(words) == 1:
+        return [make_fragment(words)]
+
+    indexed = list(enumerate(words))
+    indexed.sort(key=lambda item: float(item[1].get("x0") or 0.0))
+    gap_threshold = max(body_size * 1.15, 10.0)
+    groups: list[list[int]] = []
+    current: list[int] = []
+    previous_x1 = 0.0
+    for original_index, word in indexed:
+        x0 = float(word.get("x0") or 0.0)
+        if current and x0 - previous_x1 > gap_threshold:
+            groups.append(current)
+            current = []
+        current.append(original_index)
+        previous_x1 = max(previous_x1, float(word.get("x1") or x0))
+    if current:
+        groups.append(current)
+    if len(groups) == 1:
+        return [make_fragment(words)]
+
+    fragments: list[dict] = []
+    for group_indexes in groups:
+        index_set = set(group_indexes)
+        logical_words = [word for index, word in enumerate(words) if index in index_set]
+        fragments.append(make_fragment(logical_words))
+    return fragments
+
+
+def positioned_table_candidate_lines(lines: list[dict], marker_index: int, body_size: float) -> list[dict]:
+    marker = lines[marker_index]
+    marker_bottom = float(marker.get("bottom") or marker.get("top") or 0.0)
+    candidates: list[dict] = []
+    previous_bottom = marker_bottom
+    for line in lines[marker_index + 1 :]:
+        text = str(line.get("text") or "").strip()
+        if not text:
+            continue
+        top = float(line.get("top") or 0.0)
+        gap = top - previous_bottom
+        if candidates and gap > max(body_size * 3.0, 28.0):
+            break
+        if candidates and re.search(r"\bטבלה\s+\d+(?:\.\d+)?\b", text):
+            break
+        candidates.append(line)
+        previous_bottom = max(previous_bottom, float(line.get("bottom") or top))
+    return candidates
+
+
+def positioned_table_column_edges(fragments: list[dict], page_width: float) -> list[float]:
+    if page_width <= 0:
+        return []
+    samples = [
+        float(fragment.get("x1") or 0.0)
+        for fragment in fragments
+        if 0.0 < line_width(fragment) <= page_width * 0.36
+    ]
+    if not samples:
+        return []
+    tolerance = max(page_width * 0.035, 15.0)
+    clusters: list[list[float]] = []
+    for value in sorted(samples):
+        nearest = min(clusters, key=lambda cluster: abs(value - sum(cluster) / len(cluster))) if clusters else None
+        if nearest is not None and abs(value - sum(nearest) / len(nearest)) <= tolerance:
+            nearest.append(value)
+        else:
+            clusters.append([value])
+    supported = [cluster for cluster in clusters if len(cluster) >= 3]
+    if len(supported) > 6:
+        supported = sorted(supported, key=len, reverse=True)[:6]
+    edges = sorted((sum(cluster) / len(cluster) for cluster in supported), reverse=True)
+    return edges if 2 <= len(edges) <= 6 else []
+
+
+def reconstruct_positioned_text_table(
+    lines: list[dict],
+    marker_index: int,
+    page_width: float,
+    minimum_rows: int = 3,
+) -> tuple[list[list[str]], list[dict]] | None:
+    body_size = dominant_number([float(line.get("size") or 0.0) for line in lines], fallback=10.0)
+    candidates = positioned_table_candidate_lines(lines, marker_index, body_size)
+    fragments = [
+        fragment
+        for line in candidates
+        for fragment in positioned_line_fragments(line, body_size)
+    ]
+    column_edges = positioned_table_column_edges(fragments, page_width)
+    if len(column_edges) < 2:
+        return None
+
+    assigned: list[dict] = []
+    max_edge_distance = max(page_width * 0.11, 55.0)
+    for fragment in fragments:
+        right_edge = float(fragment.get("x1") or 0.0)
+        column = min(range(len(column_edges)), key=lambda index: abs(right_edge - column_edges[index]))
+        if abs(right_edge - column_edges[column]) > max_edge_distance:
+            continue
+        item = dict(fragment)
+        item["table_column"] = column
+        assigned.append(item)
+    if len(assigned) < 4:
+        return None
+
+    bands: list[dict] = []
+    band_tolerance = max(body_size * 0.45, 4.0)
+    for fragment in sorted(assigned, key=lambda item: (float(item.get("top") or 0.0), -float(item.get("x1") or 0.0))):
+        top = float(fragment.get("top") or 0.0)
+        if not bands or top - float(bands[-1]["top"]) > band_tolerance:
+            bands.append(
+                {
+                    "top": top,
+                    "bottom": float(fragment.get("bottom") or top),
+                    "fragments": [fragment],
+                }
+            )
+        else:
+            bands[-1]["fragments"].append(fragment)
+            bands[-1]["bottom"] = max(float(bands[-1]["bottom"]), float(fragment.get("bottom") or top))
+
+    row_gap = max(body_size * 0.9, 8.0)
+    row_bands: list[list[dict]] = []
+    current: list[dict] = []
+    previous_bottom = 0.0
+    for band in bands:
+        if current and float(band["top"]) - previous_bottom > row_gap:
+            row_bands.append(current)
+            current = []
+        current.append(band)
+        previous_bottom = max(previous_bottom, float(band["bottom"]))
+    if current:
+        row_bands.append(current)
+
+    rows: list[list[str]] = []
+    for row_band in row_bands:
+        cells: list[list[str]] = [[] for _ in column_edges]
+        for band in row_band:
+            for fragment in sorted(band["fragments"], key=lambda item: int(item["table_column"])):
+                text = normalize_text_spacing(str(fragment.get("text") or ""))
+                if text:
+                    cells[int(fragment["table_column"])].append(text)
+        row = [normalize_text_spacing(" ".join(cell)) for cell in cells]
+        if any(row):
+            rows.append(row)
+
+    multi_cell_rows = sum(1 for row in rows if sum(bool(cell) for cell in row) >= 2)
+    if len(rows) < minimum_rows or multi_cell_rows < 2:
+        return None
+    return rows, candidates
+
+
+def detect_unmarked_positioned_table(
+    visual_lines: list[dict],
+    page_width: float,
+    page_height: float,
+    start_index: int = 1,
+) -> dict | None:
+    """Detect a continued table whose repeated header has no table-number title."""
+    if not visual_lines or page_width <= 0 or page_height <= 0:
+        return None
+    body_size = dominant_number([float(line.get("size") or 0.0) for line in visual_lines], fallback=10.0)
+    possible_starts: list[int] = []
+    start_tolerance = max(body_size * 0.45, 4.0)
+    for index, line in enumerate(visual_lines):
+        top = float(line.get("top") or 0.0)
+        if not (page_height * 0.08 <= top <= page_height * 0.24):
+            continue
+        band_indexes = [
+            candidate_index for candidate_index, candidate in enumerate(visual_lines)
+            if abs(float(candidate.get("top") or 0.0) - top) <= start_tolerance
+        ]
+        fragment_count = sum(
+            len(positioned_line_fragments(visual_lines[candidate_index], body_size))
+            for candidate_index in band_indexes
+        )
+        band_start = min(band_indexes) if band_indexes else index
+        if fragment_count >= 2 and band_start not in possible_starts:
+            possible_starts.append(band_start)
+    best: tuple[float, list[list[str]], list[dict]] | None = None
+    for candidate_index in possible_starts:
+        first_line = visual_lines[candidate_index]
+        fake_marker = {
+            "text": "table continuation marker",
+            "top": float(first_line.get("top") or 0.0) - body_size * 2.0,
+            "bottom": float(first_line.get("top") or 0.0) - body_size,
+            "x0": 0.0,
+            "x1": 0.0,
+            "size": body_size,
+            "style_words": [],
+        }
+        positioned = reconstruct_positioned_text_table(
+            [fake_marker, *visual_lines[candidate_index:]],
+            0,
+            page_width,
+            minimum_rows=2,
+        )
+        if not positioned:
+            continue
+        rows, candidates = positioned
+        while rows and sum(bool(cell) for cell in rows[-1]) < 2:
+            rows.pop()
+        if not rows:
+            continue
+        column_count = max((len(row) for row in rows), default=0)
+        if column_count < 2 or (len(rows) == 2 and column_count < 3):
+            continue
+        first_filled = sum(bool(cell) for cell in rows[0])
+        multi_cell_rows = sum(1 for row in rows if sum(bool(cell) for cell in row) >= 2)
+        if first_filled < max(2, math.ceil(column_count * 0.7)):
+            continue
+        if multi_cell_rows / len(rows) < 0.65:
+            continue
+        x0 = min(float(line.get("x0") or 0.0) for line in candidates)
+        x1 = max(float(line.get("x1") or 0.0) for line in candidates)
+        if x1 - x0 < page_width * 0.62:
+            continue
+        score = len(rows) * column_count + first_filled * 2.0
+        if best is None or score > best[0]:
+            best = (score, rows, candidates)
+    if best is None:
+        return None
+    _, rows, candidates = best
+    return {
+        "index": start_index,
+        "top": min(float(line.get("top") or 0.0) for line in candidates),
+        "bottom": max(float(line.get("bottom") or 0.0) for line in candidates),
+        "x0": min(float(line.get("x0") or 0.0) for line in candidates),
+        "x1": max(float(line.get("x1") or page_width) for line in candidates),
+        "rows": len(rows),
+        "cols": max((len(row) for row in rows), default=0),
+        "sample": "טבלה (המשך)",
+        "data": rows,
+        "estimated": True,
+        "reconstructed": True,
+        "continuation": True,
+    }
+
+
+def raw_table_candidates(page: pdfplumber.page.Page) -> list[dict]:
     try:
         tables = page.find_tables()
     except Exception:
-        return detected
+        return []
 
+    candidates: list[dict] = []
     for index, table in enumerate(tables, start=1):
-        x0, top, x1, bottom = table.bbox
-        if crop_bounds is not None and not bbox_midpoint_in_bounds(float(x0), float(top), float(x1), float(bottom), crop_bounds):
+        try:
+            rows = table.extract() or []
+        except Exception:
+            rows = []
+        candidates.append({"index": index, "bbox": list(table.bbox), "rows": rows})
+    return candidates
+
+
+def table_records_from_candidates(
+    candidates: list[dict],
+    crop_bounds: tuple[float, float, float, float] | None = None,
+) -> list[dict]:
+    detected: list[dict] = []
+    for fallback_index, candidate in enumerate(candidates, start=1):
+        bbox = candidate.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
             continue
-        rows = table.extract() or []
-        normalized_rows = [[clean_table_cell(cell) for cell in row] for row in rows]
+        try:
+            x0, top, x1, bottom = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            continue
+        if crop_bounds is not None and not bbox_midpoint_in_bounds(x0, top, x1, bottom, crop_bounds):
+            continue
+        rows = candidate.get("rows") or []
+        if not isinstance(rows, list):
+            rows = []
+        normalized_rows = [
+            [clean_table_cell(cell) for cell in row]
+            for row in rows
+            if isinstance(row, (list, tuple))
+        ]
         column_count = max((len(row) for row in normalized_rows), default=0)
         sample_cells = [
             cell
@@ -2102,11 +3075,11 @@ def detect_tables(page: pdfplumber.page.Page, crop_bounds: tuple[float, float, f
         ]
         detected.append(
             {
-                "index": index,
-                "top": float(top),
-                "bottom": float(bottom),
-                "x0": float(x0),
-                "x1": float(x1),
+                "index": int(candidate.get("index") or fallback_index),
+                "top": top,
+                "bottom": bottom,
+                "x0": x0,
+                "x1": x1,
                 "rows": len(normalized_rows),
                 "cols": column_count,
                 "sample": " | ".join(sample_cells[:4]),
@@ -2116,15 +3089,98 @@ def detect_tables(page: pdfplumber.page.Page, crop_bounds: tuple[float, float, f
     return detected
 
 
-def detect_text_table_markers(lines: list[dict], start_index: int = 1, fallback_lines: list[dict] | None = None) -> list[dict]:
+def detect_tables(page: pdfplumber.page.Page, crop_bounds: tuple[float, float, float, float] | None = None) -> list[dict]:
+    return table_records_from_candidates(raw_table_candidates(page), crop_bounds)
+
+
+def prepare_structured_page(
+    *,
+    page_number: int,
+    page_width: float,
+    page_height: float,
+    raw_words: list[dict],
+    raw_chars: list[dict] | None = None,
+    raw_images: list[dict],
+    logical_lines: list[str],
+    table_candidates: list[dict],
+    crop_settings: dict,
+    crop_enabled: bool,
+) -> tuple[dict, dict]:
+    crop_bounds = page_crop_bounds(page_width, page_height, page_number, crop_settings) if crop_enabled else None
+    ordered_words = enrich_words_with_character_order(raw_words, raw_chars)
+    cropped_words = filter_words_by_crop(ordered_words, crop_bounds)
+    layout_width = layout_width_for_bounds(page_width, crop_bounds)
+    layout_words = normalize_words_to_layout_bounds(cropped_words, crop_bounds)
+    visual_lines = cluster_visual_lines(layout_words, layout_width)
+    image_regions = content_image_records(raw_images, page_width, page_height, crop_bounds)
+    tables = table_records_from_candidates(table_candidates, crop_bounds)
+    if crop_enabled:
+        corrected_lines = (
+            align_text_lines_to_style_lines(logical_lines, visual_lines, require_visual_match=True)
+            if logical_lines
+            else visual_lines_to_text_lines(visual_lines)
+        )
+    else:
+        corrected_lines = (
+            align_text_lines_to_style_lines(logical_lines, visual_lines)
+            if logical_lines
+            else visual_lines_to_text_lines(visual_lines)
+        )
+
+    table_order_lines = text_lines_to_records(logical_lines)
+    text_tables = detect_text_table_markers(
+        corrected_lines,
+        start_index=len(tables) + 1,
+        fallback_lines=table_order_lines,
+        page_width=layout_width,
+        positioned_lines=visual_lines,
+    )
+    tables.extend(text_tables)
+    if not tables:
+        continuation_table = detect_unmarked_positioned_table(
+            visual_lines,
+            layout_width,
+            page_height,
+            start_index=1,
+        )
+        if continuation_table:
+            tables.append(continuation_table)
+
+    page = {
+        "number": page_number,
+        "width": layout_width,
+        "height": page_height,
+        "source_width": page_width,
+        "source_height": page_height,
+        "lines": corrected_lines,
+        "visual_lines": visual_lines,
+        "tables": tables,
+        "image_regions": image_regions,
+    }
+    diagnostics = {
+        "crop_bounds": crop_bounds,
+        "raw_word_count": len(raw_words),
+        "cropped_word_count": len(cropped_words),
+        "logical_lines": logical_lines,
+    }
+    return page, diagnostics
+
+
+def detect_text_table_markers(
+    lines: list[dict],
+    start_index: int = 1,
+    fallback_lines: list[dict] | None = None,
+    page_width: float = 0.0,
+    positioned_lines: list[dict] | None = None,
+) -> list[dict]:
     markers: list[dict] = []
     for index, line in enumerate(lines):
         text = line["text"].strip()
-        if not re.search(r"\bטבלה\b", text):
+        if not re.match(r"^טבלה\s+\d+(?:\.\d+)?\b", text):
             continue
 
         following = []
-        for candidate in lines[index : min(len(lines), index + 44)]:
+        for candidate in lines[index:]:
             candidate_text = candidate["text"].strip()
             if len(following) >= 6 and (candidate_text.startswith("תרומתה") or candidate_text.startswith("ומגבלותיה")):
                 break
@@ -2134,7 +3190,19 @@ def detect_text_table_markers(lines: list[dict], start_index: int = 1, fallback_
 
         bottom = following[-1]["bottom"]
 
-        reconstructed_rows = reconstruct_stage_table(following) or reconstruct_delimited_text_table(following)
+        positioned_source = positioned_lines or lines
+        positioned_index = index
+        if positioned_lines:
+            marker_top = float(line.get("top") or 0.0)
+            positioned_index = min(
+                range(len(positioned_lines)),
+                key=lambda candidate_index: abs(float(positioned_lines[candidate_index].get("top") or 0.0) - marker_top),
+            )
+        positioned = reconstruct_positioned_text_table(positioned_source, positioned_index, page_width) if page_width > 0 else None
+        reconstructed_rows = reconstruct_stage_table(following) or (positioned[0] if positioned else None) or reconstruct_delimited_text_table(following)
+        if positioned and reconstructed_rows is positioned[0]:
+            following = [line, *positioned[1]]
+            bottom = following[-1]["bottom"]
         if not reconstructed_rows or len(reconstructed_rows) < 3:
             reconstructed_rows = reconstruct_table_from_matching_marker(text, fallback_lines)
         preview_rows = reconstructed_rows or [[line["text"]] for line in following]
@@ -2183,6 +3251,7 @@ def extract_pdf_structured(
     crop_settings: dict | None = None,
     page_numbers: set[int] | None = None,
     *,
+    cache_path: Path | None = None,
     embed_images: bool = True,
     image_quality: int = IMAGE_JPEG_QUALITY,
     image_max_width: int = IMAGE_MAX_EMBED_WIDTH,
@@ -2192,53 +3261,69 @@ def extract_pdf_structured(
     all_lines: list[dict] = []
     crop_settings = normalize_crop_settings(crop_settings)
     crop_enabled = crop_settings_enabled(crop_settings)
-    pypdf_reader = PdfReader(str(pdf_path))
-    text_pages = extract_requested_text_pages(pypdf_reader, page_numbers)
-
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page_number, page in enumerate(pdf.pages, start=1):
-            if page_numbers and page_number not in page_numbers:
-                continue
-            crop_bounds = page_crop_bounds(float(page.width), float(page.height), page_number, crop_settings) if crop_enabled else None
-            words = page.extract_words(
-                keep_blank_chars=False,
-                use_text_flow=True,
-                extra_attrs=["fontname", "size"],
+    page_cache: extraction_cache.PdfExtractionCache | None = None
+    try:
+        if cache_path is not None:
+            cache_path = cache_path.expanduser().resolve()
+            extraction_cache.build_cache(
+                pdf_path,
+                cache_path,
+                page_numbers=page_numbers,
+                progress_callback=progress_callback,
             )
-            words = filter_words_by_crop(words, crop_bounds)
-            layout_width = layout_width_for_bounds(float(page.width), crop_bounds)
-            layout_words = normalize_words_to_layout_bounds(words, crop_bounds)
-            lines = cluster_visual_lines(layout_words, layout_width)
-            image_regions = content_image_records(page.images, float(page.width), float(page.height), crop_bounds)
-            tables = detect_tables(page, crop_bounds)
-            correct_text_lines = text_pages.get(page_number, [])
-            if crop_enabled:
-                corrected_lines = align_text_lines_to_style_lines(correct_text_lines, lines, require_visual_match=True) if correct_text_lines else visual_lines_to_text_lines(lines)
-            else:
-                corrected_lines = align_text_lines_to_style_lines(correct_text_lines, lines) if correct_text_lines else visual_lines_to_text_lines(lines)
-
-            table_order_lines = text_lines_to_records(correct_text_lines)
-            tables.extend(
-                detect_text_table_markers(
-                    corrected_lines,
-                    start_index=len(tables) + 1,
-                    fallback_lines=table_order_lines,
+            page_cache = extraction_cache.PdfExtractionCache(cache_path)
+            total_pages = int(page_cache.manifest.get("source", {}).get("page_count") or 0)
+            selected_pages = extraction_cache.requested_pages(total_pages, page_numbers)
+            for position, page_number in enumerate(selected_pages, start=1):
+                if progress_callback:
+                    progress_callback(f"Loading cached page {page_number} ({position}/{len(selected_pages)})")
+                payload = page_cache.get_page(page_number)
+                page_data = payload.get("page", {})
+                layout = payload.get("layout", {})
+                page, _ = prepare_structured_page(
+                    page_number=page_number,
+                    page_width=float(page_data.get("width") or 0.0),
+                    page_height=float(page_data.get("height") or 0.0),
+                    raw_words=list(layout.get("words") or []),
+                    raw_chars=list(layout.get("chars") or []),
+                    raw_images=list(layout.get("images") or []),
+                    logical_lines=list(payload.get("logical_text", {}).get("lines") or []),
+                    table_candidates=list(layout.get("table_candidates") or []),
+                    crop_settings=crop_settings,
+                    crop_enabled=crop_enabled,
                 )
-            )
-            pages.append(
-                {
-                    "number": page_number,
-                    "width": layout_width,
-                    "height": float(page.height),
-                    "source_width": float(page.width),
-                    "source_height": float(page.height),
-                    "lines": corrected_lines,
-                    "visual_lines": lines,
-                    "tables": tables,
-                    "image_regions": image_regions,
-                }
-            )
-            all_lines.extend(corrected_lines)
+                pages.append(page)
+                all_lines.extend(page["lines"])
+        else:
+            pypdf_reader = PdfReader(str(pdf_path))
+            text_pages = extract_requested_text_pages(pypdf_reader, page_numbers)
+            with pdfplumber.open(str(pdf_path)) as pdf:
+                for page_number, source_page in enumerate(pdf.pages, start=1):
+                    if page_numbers and page_number not in page_numbers:
+                        continue
+                    raw_words = source_page.extract_words(
+                        keep_blank_chars=False,
+                        use_text_flow=True,
+                        extra_attrs=["fontname", "size", "non_stroking_color"],
+                    )
+                    page, _ = prepare_structured_page(
+                        page_number=page_number,
+                        page_width=float(source_page.width),
+                        page_height=float(source_page.height),
+                        raw_words=raw_words,
+                        raw_chars=list(source_page.chars),
+                        raw_images=source_page.images,
+                        logical_lines=text_pages.get(page_number, []),
+                        table_candidates=raw_table_candidates(source_page),
+                        crop_settings=crop_settings,
+                        crop_enabled=crop_enabled,
+                    )
+                    pages.append(page)
+                    all_lines.extend(page["lines"])
+    except Exception:
+        if page_cache is not None:
+            page_cache.close()
+        raise
 
     if page_numbers and not pages:
         raise ValueError(f"No pages matched the requested range: {page_range_label(page_numbers)}")
@@ -2253,11 +3338,18 @@ def extract_pdf_structured(
             if not line_overlaps_table(line, page.get("tables", []))
         ]
         content_lines, noise_lines = split_noise_lines(non_table_lines, float(page.get("width") or 0.0), float(page.get("height") or 0.0), body_size)
+        content_lines, glossary_terms = extract_glossary_terms(
+            content_lines,
+            body_size,
+            float(page.get("width") or 0.0),
+            visual_lines=page.get("visual_lines", []),
+        )
         flow_lines, secondary_blocks = separate_secondary_text(content_lines, body_size, float(page.get("width") or 0.0))
         flow_lines, question_blocks = extract_question_callouts(flow_lines, page.get("visual_lines", []), body_size)
         page_width = float(page.get("width") or 0.0)
         page["blocks"] = merge_adjacent_body_blocks(lines_to_blocks(flow_lines, body_size, page_width), page_width, body_size)
         page["blocks"].extend(question_blocks)
+        attach_glossary_terms_to_body_blocks(page["blocks"], glossary_terms)
         caption_candidates = caption_candidate_records(secondary_blocks, float(page.get("width") or 0.0))
         attach_image_caption_matches(page.get("image_regions", []), caption_candidates, float(page.get("width") or 0.0))
         recover_image_caption_continuations(
@@ -2283,17 +3375,24 @@ def extract_pdf_structured(
         )
         assign_secondary_reading_order(page["blocks"], secondary_blocks, body_size)
         page["secondary_blocks"] = secondary_blocks
+        page["glossary_terms"] = glossary_terms
         page["noise_lines"] = noise_lines
         page["regions"] = build_layout_regions(page["blocks"], secondary_blocks, page.get("tables", []), float(page.get("width") or 0.0), image_regions=page.get("image_regions", []), figure_groups=page.get("figure_groups", []))
 
-    if embed_images:
-        embed_page_images(
-            pdf_path,
-            pages,
-            quality=image_quality,
-            max_width=image_max_width,
-            progress_callback=progress_callback,
-        )
+    try:
+        if embed_images:
+            embed_page_images(
+                pdf_path,
+                pages,
+                quality=image_quality,
+                max_width=image_max_width,
+                page_cache=page_cache,
+                progress_callback=progress_callback,
+            )
+    finally:
+        if page_cache is not None:
+            page_cache.close()
+            page_cache = None
 
     plain_text_parts: list[str] = []
     for page in pages:
@@ -2325,93 +3424,118 @@ def build_layout_debug_report(
     pdf_path: Path,
     crop_settings: dict | None = None,
     page_numbers: set[int] | None = None,
+    cache_path: Path | None = None,
 ) -> dict:
     pdf_path = pdf_path.expanduser().resolve()
     crop_settings = normalize_crop_settings(crop_settings)
     crop_enabled = crop_settings_enabled(crop_settings)
-    pypdf_reader = PdfReader(str(pdf_path))
-    text_pages = extract_requested_text_pages(pypdf_reader, page_numbers)
     report_pages: list[dict] = []
     all_corrected_lines: list[dict] = []
 
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page_number, page in enumerate(pdf.pages, start=1):
-            if page_numbers and page_number not in page_numbers:
-                continue
-            crop_bounds = page_crop_bounds(float(page.width), float(page.height), page_number, crop_settings) if crop_enabled else None
-            raw_words = page.extract_words(
-                keep_blank_chars=False,
-                use_text_flow=True,
-                extra_attrs=["fontname", "size"],
-            )
-            cropped_words = filter_words_by_crop(raw_words, crop_bounds)
-            layout_width = layout_width_for_bounds(float(page.width), crop_bounds)
-            layout_words = normalize_words_to_layout_bounds(cropped_words, crop_bounds)
-            visual_lines = cluster_visual_lines(layout_words, layout_width)
-            image_regions = content_image_records(page.images, float(page.width), float(page.height), crop_bounds)
-            logical_lines = text_pages.get(page_number, [])
-            if crop_enabled:
-                corrected_lines = align_text_lines_to_style_lines(logical_lines, visual_lines, require_visual_match=True) if logical_lines else visual_lines_to_text_lines(visual_lines)
-            else:
-                corrected_lines = align_text_lines_to_style_lines(logical_lines, visual_lines) if logical_lines else visual_lines_to_text_lines(visual_lines)
+    def append_page_report(page: dict, diagnostics: dict) -> None:
+        page_number = int(page["number"])
+        logical_lines = diagnostics["logical_lines"]
+        visual_lines = page["visual_lines"]
+        corrected_lines = page["lines"]
+        tables = page["tables"]
+        image_regions = page["image_regions"]
+        crop_bounds = diagnostics["crop_bounds"]
+        report_pages.append(
+            {
+                "number": page_number,
+                "page_width": round(float(page["source_width"]), 2),
+                "page_height": round(float(page["source_height"]), 2),
+                "layout_width": round(float(page["width"]), 2),
+                "crop_bounds": [round(float(value), 2) for value in crop_bounds] if crop_bounds else None,
+                "word_counts": {
+                    "raw": diagnostics["raw_word_count"],
+                    "after_crop": diagnostics["cropped_word_count"],
+                },
+                "pypdf_lines": [
+                    {
+                        "index": index,
+                        "text": clean_extracted_text_line(text),
+                        "best_visual_match": best_style_line_match(text, visual_lines),
+                    }
+                    for index, text in enumerate(logical_lines)
+                ],
+                "visual_lines": [
+                    line_debug_record(line, index=index, role="visual")
+                    for index, line in enumerate(visual_lines)
+                ],
+                "corrected_lines": [
+                    line_debug_record(line, index=index, role="corrected")
+                    for index, line in enumerate(corrected_lines)
+                ],
+                "tables": [
+                    {
+                        "index": table.get("index"),
+                        "top": round(float(table.get("top") or 0.0), 2),
+                        "bottom": round(float(table.get("bottom") or 0.0), 2),
+                        "rows": table.get("rows"),
+                        "cols": table.get("cols"),
+                        "estimated": bool(table.get("estimated")),
+                        "reconstructed": bool(table.get("reconstructed")),
+                        "continuation": bool(table.get("continuation")),
+                        "sample": table.get("sample", ""),
+                    }
+                    for table in tables
+                ],
+                "_corrected_lines_for_classification": corrected_lines,
+                "_visual_lines_for_classification": visual_lines,
+                "_tables_for_classification": tables,
+                "_image_regions_for_classification": image_regions,
+            }
+        )
+        all_corrected_lines.extend(corrected_lines)
 
-            table_order_lines = text_lines_to_records(logical_lines)
-            tables = detect_tables(page, crop_bounds)
-            tables.extend(
-                detect_text_table_markers(
-                    corrected_lines,
-                    start_index=len(tables) + 1,
-                    fallback_lines=table_order_lines,
+    if cache_path is not None:
+        cache_path = cache_path.expanduser().resolve()
+        extraction_cache.build_cache(pdf_path, cache_path, page_numbers=page_numbers)
+        with extraction_cache.PdfExtractionCache(cache_path) as page_cache:
+            total_pages = int(page_cache.manifest.get("source", {}).get("page_count") or 0)
+            for page_number in extraction_cache.requested_pages(total_pages, page_numbers):
+                payload = page_cache.get_page(page_number)
+                page_data = payload.get("page", {})
+                layout = payload.get("layout", {})
+                page, diagnostics = prepare_structured_page(
+                    page_number=page_number,
+                    page_width=float(page_data.get("width") or 0.0),
+                    page_height=float(page_data.get("height") or 0.0),
+                    raw_words=list(layout.get("words") or []),
+                    raw_chars=list(layout.get("chars") or []),
+                    raw_images=list(layout.get("images") or []),
+                    logical_lines=list(payload.get("logical_text", {}).get("lines") or []),
+                    table_candidates=list(layout.get("table_candidates") or []),
+                    crop_settings=crop_settings,
+                    crop_enabled=crop_enabled,
                 )
-            )
-
-            report_pages.append(
-                {
-                    "number": page_number,
-                    "page_width": round(float(page.width), 2),
-                    "page_height": round(float(page.height), 2),
-                    "layout_width": round(layout_width, 2),
-                    "crop_bounds": [round(float(value), 2) for value in crop_bounds] if crop_bounds else None,
-                    "word_counts": {
-                        "raw": len(raw_words),
-                        "after_crop": len(cropped_words),
-                    },
-                    "pypdf_lines": [
-                        {
-                            "index": index,
-                            "text": clean_extracted_text_line(text),
-                            "best_visual_match": best_style_line_match(text, visual_lines),
-                        }
-                        for index, text in enumerate(logical_lines)
-                    ],
-                    "visual_lines": [
-                        line_debug_record(line, index=index, role="visual")
-                        for index, line in enumerate(visual_lines)
-                    ],
-                    "corrected_lines": [
-                        line_debug_record(line, index=index, role="corrected")
-                        for index, line in enumerate(corrected_lines)
-                    ],
-                    "tables": [
-                        {
-                            "index": table.get("index"),
-                            "top": round(float(table.get("top") or 0.0), 2),
-                            "bottom": round(float(table.get("bottom") or 0.0), 2),
-                            "rows": table.get("rows"),
-                            "cols": table.get("cols"),
-                            "estimated": bool(table.get("estimated")),
-                            "reconstructed": bool(table.get("reconstructed")),
-                            "sample": table.get("sample", ""),
-                        }
-                        for table in tables
-                    ],
-                    "_corrected_lines_for_classification": corrected_lines,
-                    "_visual_lines_for_classification": visual_lines,
-                    "_tables_for_classification": tables,
-                    "_image_regions_for_classification": image_regions,
-                }
-            )
-            all_corrected_lines.extend(corrected_lines)
+                append_page_report(page, diagnostics)
+    else:
+        pypdf_reader = PdfReader(str(pdf_path))
+        text_pages = extract_requested_text_pages(pypdf_reader, page_numbers)
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page_number, source_page in enumerate(pdf.pages, start=1):
+                if page_numbers and page_number not in page_numbers:
+                    continue
+                raw_words = source_page.extract_words(
+                    keep_blank_chars=False,
+                    use_text_flow=True,
+                    extra_attrs=["fontname", "size", "non_stroking_color"],
+                )
+                page, diagnostics = prepare_structured_page(
+                    page_number=page_number,
+                    page_width=float(source_page.width),
+                    page_height=float(source_page.height),
+                    raw_words=raw_words,
+                    raw_chars=list(source_page.chars),
+                    raw_images=source_page.images,
+                    logical_lines=text_pages.get(page_number, []),
+                    table_candidates=raw_table_candidates(source_page),
+                    crop_settings=crop_settings,
+                    crop_enabled=crop_enabled,
+                )
+                append_page_report(page, diagnostics)
 
     body_size = dominant_number([line["size"] for line in all_corrected_lines])
     for page_report in report_pages:
@@ -2426,11 +3550,18 @@ def build_layout_debug_report(
             float(page_report["page_height"]),
             body_size,
         )
+        content_lines, glossary_terms = extract_glossary_terms(
+            content_lines,
+            body_size,
+            float(page_report["layout_width"]),
+            visual_lines=visual_lines,
+        )
         flow_lines, secondary_blocks = separate_secondary_text(content_lines, body_size, float(page_report["layout_width"]))
         flow_lines, question_blocks = extract_question_callouts(flow_lines, visual_lines, body_size)
         layout_width = float(page_report["layout_width"])
         body_blocks = merge_adjacent_body_blocks(lines_to_blocks(flow_lines, body_size, layout_width), layout_width, body_size)
         body_blocks.extend(question_blocks)
+        attach_glossary_terms_to_body_blocks(body_blocks, glossary_terms)
         assign_secondary_reading_order(body_blocks, secondary_blocks, body_size)
         caption_candidates = caption_candidate_records(secondary_blocks, float(page_report["layout_width"]))
         attach_image_caption_matches(image_regions, caption_candidates, float(page_report["layout_width"]))
@@ -2458,6 +3589,24 @@ def build_layout_debug_report(
         page_report["classification"] = {
             "body_lines": [line_debug_record(line, role="body") for line in flow_lines],
             "noise_lines": [line_debug_record(line, role="noise") for line in noise_lines],
+            "glossary_terms": [
+                {
+                    "id": str(term.get("id") or ""),
+                    "text": str(term.get("text") or ""),
+                    "body_term_text": str(term.get("body_term_text") or ""),
+                    "side": str(term.get("side") or ""),
+                    "linked_body_block_id": str(term.get("linked_body_block_id") or ""),
+                    "match_confidence": float(term.get("match_confidence") or 0.0),
+                    "match_reason": str(term.get("match_reason") or ""),
+                    "source": str(term.get("source") or ""),
+                    "duplicate_removed": str(term.get("duplicate_removed") or ""),
+                    "block_offset_em": float(term.get("block_offset_em") or 0.0),
+                    "top": round(float(term.get("top") or 0.0), 2),
+                    "bottom": round(float(term.get("bottom") or 0.0), 2),
+                    "lines": [line_debug_record(line, role="glossary") for line in term.get("lines", [])],
+                }
+                for term in glossary_terms
+            ],
             "caption_blocks": [
                 {
                     "id": f"caption-{index}",
@@ -2506,6 +3655,8 @@ def build_layout_debug_report(
 
     return {
         "source": str(pdf_path),
+        "extraction_cache": str(cache_path) if cache_path is not None else None,
+        "cache_used": cache_path is not None,
         "requested_pages": page_range_label(page_numbers),
         "crop_enabled": crop_enabled,
         "crop_settings": crop_settings,
@@ -2518,9 +3669,15 @@ def write_layout_debug_report(
     output_dir: Path,
     crop_settings: dict | None = None,
     page_numbers: set[int] | None = None,
+    cache_path: Path | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    report = build_layout_debug_report(pdf_path, crop_settings=crop_settings, page_numbers=page_numbers)
+    report = build_layout_debug_report(
+        pdf_path,
+        crop_settings=crop_settings,
+        page_numbers=page_numbers,
+        cache_path=cache_path,
+    )
     output_path = output_dir / f"{safe_slug(pdf_path.name)}-layout-debug.json"
     output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return output_path
@@ -2637,6 +3794,18 @@ def figure_group_html(group: dict, members: list[dict], caption_text: str = "") 
     )
 
 
+def glossary_term_html(term: dict) -> str:
+    offset = float(term.get("block_offset_em") or 0.0)
+    style_attr = f' style="--glossary-offset:{offset:.2f}em"'
+    body_term = html.escape(str(term.get("body_term_text") or term.get("text") or ""), quote=True)
+    content = term.get("html") or text_with_bidi_isolates(str(term.get("text") or ""))
+    return (
+        f'<aside class="glossary-term" data-body-term="{body_term}" '
+        f'data-match-confidence="{float(term.get("match_confidence") or 0.0):.2f}"'
+        f'{style_attr}>{content}</aside>'
+    )
+
+
 def pages_to_html(pages: list[dict]) -> str:
     page_html: list[str] = []
     for page in pages:
@@ -2739,7 +3908,20 @@ def pages_to_html(pages: list[dict]) -> str:
                     block = item
                     tag = block["tag"]
                     class_attr = f' class="{html.escape(str(block["class"]))}"' if block.get("class") else ""
-                    page_items.append({"html": f"<{tag}{class_attr}>{block['html']}</{tag}>"})
+                    glossary_terms = block.get("glossary_terms", []) if tag == "p" else []
+                    if glossary_terms:
+                        side = str(glossary_terms[0].get("side") or "left")
+                        notes_html = "".join(glossary_term_html(term) for term in glossary_terms)
+                        page_items.append(
+                            {
+                                "html": (
+                                    f'<div class="body-with-glossary glossary-{html.escape(side)}">'
+                                    f'{notes_html}<{tag}{class_attr}>{block["html"]}</{tag}></div>'
+                                )
+                            }
+                        )
+                    else:
+                        page_items.append({"html": f"<{tag}{class_attr}>{block['html']}</{tag}>"})
         page_html.append(
             f'<section class="page" id="page-{page["number"]}">'
             f'<div class="page-marker">עמוד {page["number"]}</div>'
@@ -2792,6 +3974,8 @@ def build_conversion_report(
     images_enabled: bool = True,
     image_quality: int = IMAGE_JPEG_QUALITY,
     image_max_width: int = IMAGE_MAX_EMBED_WIDTH,
+    cache_used: bool = False,
+    cache_name: str = "",
 ) -> dict:
     tables = [table for page in pages for table in page.get("tables", [])]
     secondary_blocks = [block for page in pages for block in page.get("secondary_blocks", [])]
@@ -2821,6 +4005,9 @@ def build_conversion_report(
         "image_max_width": image_max_width,
         "embedded_images": len(embedded_sources),
         "embedded_image_bytes": embedded_image_bytes,
+        "cache_used": cache_used,
+        "cache_name": cache_name,
+        "cached_image_renders": sum(1 for page in pages if page.get("image_render_source") == "cache"),
     }
 
 
@@ -2838,6 +4025,7 @@ def conversion_report_to_html(report: dict | None) -> str:
         return ""
     rows = [
         ("Extraction mode", report.get("mode", "")),
+        ("Layout cache", "used" if report.get("cache_used") else "off"),
         ("Requested pages", report.get("requested_range", "all pages")),
         ("Converted pages", f'{report.get("converted_pages", 0)} of {report.get("source_pages", 0)}'),
         ("Crop bounds", "enabled" if report.get("crop_enabled") else "off"),
@@ -2851,6 +4039,7 @@ def conversion_report_to_html(report: dict | None) -> str:
         ("JPEG quality", report.get("image_quality", IMAGE_JPEG_QUALITY) if report.get("images_enabled", True) else "n/a"),
         ("Maximum image width", f'{report.get("image_max_width", IMAGE_MAX_EMBED_WIDTH)} px' if report.get("images_enabled", True) else "n/a"),
         ("Images embedded", report.get("embedded_images", 0)),
+        ("Cached image renders", report.get("cached_image_renders", 0)),
         ("Embedded image data", format_byte_size(report.get("embedded_image_bytes", 0))),
         ("Estimated HTML size", format_byte_size(report.get("estimated_output_bytes", 0))) if report.get("estimated_output_bytes") is not None else ("Estimated HTML size", "pending"),
     ]
@@ -2864,6 +4053,8 @@ def conversion_report_to_html(report: dict | None) -> str:
         page_list += f", ... +{len(page_numbers) - 40} more"
     if page_list:
         rows_html += f"<dt>Page list</dt><dd>{html.escape(page_list)}</dd>"
+    if report.get("cache_used") and report.get("cache_name"):
+        rows_html += f'<dt>Cache file</dt><dd>{html.escape(str(report["cache_name"]))}</dd>'
     return f'<details class="conversion-report"><summary>Conversion report</summary><dl>{rows_html}</dl></details>'
 
 
@@ -3004,6 +4195,137 @@ def build_reader_html(
     }}
     .content p {{
       margin: 0 0 1.05em;
+      text-align: justify;
+      text-align-last: right;
+    }}
+    .content .term-accent {{
+      color: #079f98;
+      font-weight: 700;
+    }}
+    .content .research-citation {{
+      position: relative;
+      display: inline-block;
+      direction: ltr;
+      unicode-bidi: isolate;
+      vertical-align: super;
+      line-height: 1;
+      margin-inline: .08em;
+    }}
+    .content .citation-marker {{
+      display: inline-grid;
+      place-items: center;
+      width: 1.25em;
+      height: 1.25em;
+      min-width: 0;
+      padding: 0;
+      border: 1px solid color-mix(in srgb, var(--accent) 52%, transparent);
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--accent-soft) 70%, var(--paper));
+      color: var(--accent);
+      font: 700 .66em/1 "Segoe UI Symbol", "Segoe UI", sans-serif;
+      cursor: pointer;
+    }}
+    .content .citation-marker:focus-visible {{
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }}
+    .content .citation-popover {{
+      --citation-shift: 0px;
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + .6em);
+      z-index: 30;
+      width: max-content;
+      max-width: min(30rem, calc(100vw - 32px));
+      padding: .65em .8em;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--paper);
+      box-shadow: 0 10px 30px rgba(0,0,0,.2);
+      color: var(--ink);
+      direction: ltr;
+      unicode-bidi: isolate;
+      font-size: .78em;
+      font-weight: 500;
+      line-height: 1.4;
+      text-align: left;
+      white-space: normal;
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(calc(-50% + var(--citation-shift)));
+      transition: opacity .12s ease, visibility .12s ease;
+    }}
+    .content .research-citation:hover .citation-popover,
+    .content .research-citation:focus-within .citation-popover,
+    .content .research-citation.is-open .citation-popover {{
+      visibility: visible;
+      opacity: 1;
+      pointer-events: auto;
+    }}
+    .content .body-with-glossary {{
+      position: relative;
+      display: block;
+      direction: rtl;
+      margin: 0 0 1.05em;
+    }}
+    .content .body-with-glossary > p {{
+      direction: rtl;
+      margin: 0;
+    }}
+    .content .glossary-term {{
+      display: none;
+      direction: rtl;
+      color: #079f98;
+      font-size: .88em;
+      font-weight: 700;
+      line-height: 1.35;
+      text-align: right;
+    }}
+    .content .glossary-popover {{
+      position: absolute;
+      z-index: 20;
+      width: min(19rem, calc(100vw - 48px));
+      padding: .7em .85em;
+      border: 1px solid color-mix(in srgb, #079f98 38%, var(--line));
+      border-radius: 10px;
+      background: var(--paper);
+      box-shadow: 0 10px 30px rgba(0,0,0,.18);
+      color: #087f79;
+      font-size: .9em;
+      font-weight: 700;
+      line-height: 1.45;
+      text-align: right;
+    }}
+    .content .glossary-popover[hidden] {{ display: none; }}
+    .content .glossary-trigger {{
+      cursor: pointer;
+      border-radius: .18em;
+      text-decoration: underline dotted currentColor;
+      text-underline-offset: .18em;
+    }}
+    .content .glossary-trigger:focus-visible {{
+      outline: 2px solid #079f98;
+      outline-offset: 3px;
+    }}
+    @media (min-width: 1450px) {{
+      .content .glossary-term {{
+        position: absolute;
+        top: var(--glossary-offset, 0);
+        display: block;
+        width: clamp(10rem, 13vw, 14rem);
+        z-index: 3;
+      }}
+      .content .glossary-left > .glossary-term {{
+        right: calc(100% + clamp(64px, 6vw, 104px));
+      }}
+      .content .glossary-right > .glossary-term {{
+        left: calc(100% + clamp(64px, 6vw, 104px));
+      }}
+      .content .glossary-trigger {{
+        cursor: inherit;
+        text-decoration: none;
+      }}
     }}
     .content .caption {{
       margin: .9em 0 1.15em;
@@ -3499,6 +4821,50 @@ def build_reader_html(
         font-weight: 700;
       }}
     }}
+    @media print {{
+      .topbar, .findbar, .conversion-report, .image-lightbox {{ display: none !important; }}
+      body, main, .reader {{
+        width: 100%;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        background: #fff;
+        box-shadow: none;
+      }}
+      .page {{
+        break-after: page;
+        border: 0;
+      }}
+      .page:last-child {{ break-after: auto; }}
+      figure, table, aside {{ break-inside: avoid; }}
+      .content .glossary-term {{
+        position: static;
+        display: block;
+        width: auto;
+        margin: .35em 0;
+        padding-inline-start: .6em;
+        border-inline-start: 2px solid currentColor;
+      }}
+      .content .research-citation {{
+        vertical-align: baseline;
+        margin: 0;
+      }}
+      .content .citation-marker {{ display: none; }}
+      .content .citation-popover {{
+        position: static;
+        display: inline;
+        width: auto;
+        max-width: none;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        box-shadow: none;
+        font-size: 1em;
+        visibility: visible;
+        opacity: 1;
+        transform: none;
+      }}
+    }}
   </style>
 </head>
 <body>
@@ -3519,6 +4885,7 @@ def build_reader_html(
         </select>
         <button type="button" id="theme" title="מצב כהה או בהיר">כהה</button>
         <button type="button" id="findToggle" title="חיפוש בטקסט">חיפוש</button>
+        <button type="button" id="printReader" title="הדפסת העמודים שנבחרו">הדפסה</button>
       </div>
     </div>
   </header>
@@ -3683,6 +5050,139 @@ def build_reader_html(
       }});
     }}
 
+    function closeResearchCitations(except = null) {{
+      reader.querySelectorAll('.research-citation.is-open').forEach(citation => {{
+        if (citation === except) return;
+        citation.classList.remove('is-open');
+        citation.querySelector('.citation-marker')?.setAttribute('aria-expanded', 'false');
+      }});
+    }}
+
+    function positionResearchCitation(citation) {{
+      const popover = citation.querySelector('.citation-popover');
+      if (!popover) return;
+      popover.style.setProperty('--citation-shift', '0px');
+      const box = popover.getBoundingClientRect();
+      const viewportPadding = 10;
+      let shift = 0;
+      if (box.left < viewportPadding) shift += viewportPadding - box.left;
+      if (box.right > window.innerWidth - viewportPadding) {{
+        shift -= box.right - (window.innerWidth - viewportPadding);
+      }}
+      popover.style.setProperty('--citation-shift', `${{shift}}px`);
+    }}
+
+    function enhanceResearchCitations() {{
+      reader.querySelectorAll('.research-citation').forEach(citation => {{
+        if (citation.dataset.enhanced) return;
+        citation.dataset.enhanced = 'true';
+        const marker = citation.querySelector('.citation-marker');
+        if (!marker) return;
+
+        const position = () => positionResearchCitation(citation);
+        citation.addEventListener('mouseenter', position);
+        marker.addEventListener('focus', position);
+        marker.addEventListener('click', event => {{
+          event.preventDefault();
+          event.stopPropagation();
+          const opening = !citation.classList.contains('is-open');
+          closeResearchCitations(citation);
+          citation.classList.toggle('is-open', opening);
+          marker.setAttribute('aria-expanded', opening ? 'true' : 'false');
+          if (opening) position();
+        }});
+        marker.addEventListener('keydown', event => {{
+          if (event.key !== 'Escape') return;
+          citation.classList.remove('is-open');
+          marker.setAttribute('aria-expanded', 'false');
+          marker.focus();
+        }});
+      }});
+
+      if (!reader.dataset.citationOutsideClose) {{
+        reader.dataset.citationOutsideClose = 'true';
+        document.addEventListener('click', () => closeResearchCitations());
+      }}
+    }}
+
+    function enhanceGlossaryPopovers() {{
+      const compactLayout = window.matchMedia('(max-width: 1449px)');
+      const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+
+      reader.querySelectorAll('.body-with-glossary').forEach(wrapper => {{
+        wrapper.querySelectorAll(':scope > .glossary-term').forEach(note => {{
+          if (note.dataset.popoverEnhanced) return;
+          const wanted = normalize(note.dataset.bodyTerm);
+          const accents = Array.from(wrapper.querySelectorAll('p .term-accent'));
+          const trigger = accents.find(item => {{
+            const value = normalize(item.textContent);
+            return value && wanted && (wanted.includes(value) || value.includes(wanted));
+          }});
+          if (!trigger) return;
+
+          note.dataset.popoverEnhanced = 'true';
+          const popover = document.createElement('div');
+          popover.className = 'glossary-popover';
+          popover.innerHTML = note.innerHTML;
+          popover.hidden = true;
+          wrapper.append(popover);
+
+          const close = () => {{
+            popover.hidden = true;
+            trigger.setAttribute('aria-expanded', 'false');
+          }};
+          const position = () => {{
+            const triggerBox = trigger.getBoundingClientRect();
+            const wrapperBox = wrapper.getBoundingClientRect();
+            popover.style.top = `${{triggerBox.bottom - wrapperBox.top + 8}}px`;
+            popover.style.right = `${{Math.max(0, wrapperBox.right - triggerBox.right)}}px`;
+          }};
+          const syncMode = () => {{
+            if (compactLayout.matches) {{
+              trigger.classList.add('glossary-trigger');
+              trigger.tabIndex = 0;
+              trigger.setAttribute('role', 'button');
+              trigger.setAttribute('aria-expanded', 'false');
+              trigger.setAttribute('aria-label', `${{trigger.textContent.trim()}}: show glossary note`);
+            }} else {{
+              close();
+              trigger.classList.remove('glossary-trigger');
+              trigger.removeAttribute('tabindex');
+              trigger.removeAttribute('role');
+              trigger.removeAttribute('aria-expanded');
+              trigger.removeAttribute('aria-label');
+            }}
+          }};
+          const toggle = event => {{
+            if (!compactLayout.matches) return;
+            event.preventDefault();
+            const opening = popover.hidden;
+            wrapper.querySelectorAll('.glossary-popover:not([hidden])').forEach(open => {{
+              if (open !== popover) open.hidden = true;
+            }});
+            if (opening) {{
+              position();
+              popover.hidden = false;
+            }} else {{
+              popover.hidden = true;
+            }}
+            trigger.setAttribute('aria-expanded', opening ? 'true' : 'false');
+          }};
+
+          trigger.addEventListener('click', toggle);
+          trigger.addEventListener('keydown', event => {{
+            if (event.key === 'Enter' || event.key === ' ') toggle(event);
+            if (event.key === 'Escape') close();
+          }});
+          document.addEventListener('click', event => {{
+            if (!wrapper.contains(event.target)) close();
+          }});
+          compactLayout.addEventListener?.('change', syncMode);
+          syncMode();
+        }});
+      }});
+    }}
+
     function render() {{
       const pages = splitPages(source);
       const needle = query.value;
@@ -3703,6 +5203,8 @@ def build_reader_html(
       }}
       enhanceTableCarousels();
       enhanceImageLightbox();
+      enhanceResearchCitations();
+      enhanceGlossaryPopovers();
       const wordCount = source.split(/\\s+/).filter(Boolean).length;
       stats.textContent = `${{pages.length}} עמודים · כ-${{wordCount.toLocaleString('he-IL')}} מילים · מקור: {source_html}`;
     }}
@@ -3741,6 +5243,7 @@ def build_reader_html(
       document.getElementById('findbar').classList.toggle('hidden');
       query.focus();
     }});
+    document.getElementById('printReader').addEventListener('click', () => window.print());
     document.getElementById('clear').addEventListener('click', () => {{
       query.value = '';
       render();
@@ -3779,6 +5282,7 @@ def create_reader(
     crop_settings: dict | None = None,
     page_numbers: set[int] | None = None,
     *,
+    cache_path: Path | None = None,
     embed_images: bool = True,
     image_quality: int = IMAGE_JPEG_QUALITY,
     image_max_width: int = IMAGE_MAX_EMBED_WIDTH,
@@ -3791,6 +5295,7 @@ def create_reader(
         raise ValueError("Input file must be a PDF")
     image_quality = validate_image_quality(image_quality)
     image_max_width = validate_image_max_width(image_max_width)
+    cache_path = cache_path.expanduser().resolve() if cache_path is not None else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     total_source_pages = len(PdfReader(str(pdf_path)).pages)
@@ -3801,6 +5306,7 @@ def create_reader(
             pdf_path,
             crop_settings=crop_settings,
             page_numbers=page_numbers,
+            cache_path=cache_path,
             embed_images=embed_images,
             image_quality=image_quality,
             image_max_width=image_max_width,
@@ -3816,8 +5322,12 @@ def create_reader(
             images_enabled=embed_images,
             image_quality=image_quality,
             image_max_width=image_max_width,
+            cache_used=cache_path is not None,
+            cache_name=cache_path.name if cache_path is not None else "",
         )
-    except Exception:
+    except Exception as exc:
+        if cache_path is not None and isinstance(exc, extraction_cache.CacheError):
+            raise
         text, page_count, char_count = extract_pdf_text(
             pdf_path,
             crop_settings=crop_settings,
@@ -3835,6 +5345,7 @@ def create_reader(
             images_enabled=embed_images,
             image_quality=image_quality,
             image_max_width=image_max_width,
+            cache_used=False,
         )
     if char_count == 0:
         raise ValueError("No text layer was found in this PDF. OCR is required for scanned-only PDFs.")
@@ -3893,6 +5404,60 @@ def crop_settings_from_fields(fields: dict[str, str]) -> dict:
     )
 
 
+def upload_cache_path(filename: str, pdf_data: bytes) -> Path:
+    digest = hashlib.sha256(pdf_data).hexdigest()[:12]
+    return extraction_cache.DEFAULT_CACHE_DIR / f"{safe_slug(filename)}-{digest}.pdfcache"
+
+
+def extract_pdf_outline(reader: PdfReader) -> list[dict]:
+    """Return flattened PDF outline entries with physical PDF page ranges."""
+    flattened: list[dict] = []
+
+    def visit(nodes: list, level: int = 0) -> None:
+        for node in nodes:
+            if isinstance(node, list):
+                visit(node, level + 1)
+                continue
+            try:
+                page_number = int(reader.get_destination_page_number(node)) + 1
+            except Exception:
+                continue
+            if not 1 <= page_number <= len(reader.pages):
+                continue
+            title = normalize_text_spacing(str(getattr(node, "title", "") or ""))
+            if not title:
+                continue
+            flattened.append(
+                {
+                    "title": title,
+                    "level": max(0, level),
+                    "start_page": page_number,
+                }
+            )
+
+    try:
+        outline = reader.outline
+    except Exception:
+        outline = []
+    if isinstance(outline, list):
+        visit(outline)
+
+    total_pages = len(reader.pages)
+    for index, entry in enumerate(flattened):
+        start_page = int(entry["start_page"])
+        end_page = total_pages
+        for following in flattened[index + 1 :]:
+            following_page = int(following["start_page"])
+            if int(following["level"]) <= int(entry["level"]) and following_page >= start_page:
+                end_page = max(start_page, following_page - 1)
+                break
+        entry["end_page"] = max(start_page, end_page)
+        entry["page_range"] = (
+            str(start_page) if start_page == entry["end_page"] else f'{start_page}-{entry["end_page"]}'
+        )
+    return flattened
+
+
 def render_pdf_previews(pdf_data: bytes) -> dict:
     if not PDFTOPPM.exists():
         raise FileNotFoundError(f"pdftoppm was not found: {PDFTOPPM}")
@@ -3902,8 +5467,9 @@ def render_pdf_previews(pdf_data: bytes) -> dict:
         tmp_path = Path(tmpdir)
         input_path = tmp_path / "preview.pdf"
         input_path.write_bytes(pdf_data)
-        with pdfplumber.open(str(input_path)) as pdf:
-            page_count = len(pdf.pages)
+        reader = PdfReader(str(input_path))
+        page_count = len(reader.pages)
+        outline = extract_pdf_outline(reader)
 
         for page_number, side in ((1, "right"), (2, "left")):
             if page_number > page_count:
@@ -3939,7 +5505,7 @@ def render_pdf_previews(pdf_data: bytes) -> dict:
                 }
             )
 
-    return {"pages": previews}
+    return {"pages": previews, "page_count": page_count, "outline": outline}
 
 
 class ReaderToolHandler(BaseHTTPRequestHandler):
@@ -4001,8 +5567,10 @@ class ReaderToolHandler(BaseHTTPRequestHandler):
             crop_settings = crop_settings_from_fields(fields)
             page_numbers = parse_page_ranges(fields.get("page_range"))
             embed_images = fields.get("no_images") not in {"on", "true", "1"}
+            use_cache = fields.get("use_cache") in {"on", "true", "1"}
             image_quality = validate_image_quality(int(fields.get("image_quality") or IMAGE_JPEG_QUALITY))
             image_max_width = validate_image_max_width(int(fields.get("image_max_width") or IMAGE_MAX_EMBED_WIDTH))
+            cache_path = upload_cache_path(filename, data) if use_cache else None
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 input_path = Path(tmpdir) / f"{uuid.uuid4()}.pdf"
@@ -4012,6 +5580,7 @@ class ReaderToolHandler(BaseHTTPRequestHandler):
                     DEFAULT_OUTPUT_DIR,
                     crop_settings=crop_settings,
                     page_numbers=page_numbers,
+                    cache_path=cache_path,
                     embed_images=embed_images,
                     image_quality=image_quality,
                     image_max_width=image_max_width,
@@ -4102,6 +5671,70 @@ UPLOAD_PAGE = """<!doctype html>
       width: 20px;
       height: 20px;
       margin: 0;
+    }
+    .toc-tools {
+      margin-top: 20px;
+      border: 1px solid #d9d1c5;
+      border-radius: 8px;
+      padding: 16px;
+      background: #fbf8f1;
+    }
+    .toc-tools[hidden] { display: none; }
+    .toc-tools h2 {
+      margin: 0 0 6px;
+      font-size: 20px;
+    }
+    .toc-tools > p {
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .toc-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .toc-actions button {
+      min-height: 34px;
+      margin: 0;
+      border: 1px solid #176f68;
+      background: transparent;
+      color: #176f68;
+      font-size: 13px;
+    }
+    .toc-list {
+      max-height: 350px;
+      overflow: auto;
+      border-block: 1px solid #e0d7ca;
+      padding-block: 6px;
+    }
+    .toc-item {
+      display: grid;
+      grid-template-columns: 20px minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: start;
+      padding: 7px 4px 7px 0;
+      padding-inline-start: calc(var(--toc-level, 0) * 18px + 4px);
+      border-bottom: 1px solid #eee7dc;
+      cursor: pointer;
+    }
+    .toc-item:last-child { border-bottom: 0; }
+    .toc-item input { margin-top: 3px; }
+    .toc-title {
+      min-width: 0;
+      line-height: 1.4;
+    }
+    .toc-range {
+      direction: ltr;
+      color: #756d63;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .toc-status {
+      margin: 10px 0 0;
+      color: #176f68;
+      font-size: 13px;
+      font-weight: 600;
     }
     .crop-tools {
       margin-top: 20px;
@@ -4239,9 +5872,20 @@ UPLOAD_PAGE = """<!doctype html>
     <form action="/convert" method="post" enctype="multipart/form-data">
       <input id="pdfInput" type="file" name="pdf" accept="application/pdf,.pdf" required>
       <label class="field">Page range
-        <input type="text" name="page_range" placeholder="all pages, or 1-5,8,12" inputmode="numeric">
+        <input id="pageRangeInput" type="text" name="page_range" placeholder="all pages, or 1-5,8,12" inputmode="numeric">
         <span>Leave empty to convert the full PDF. Use this for quick tests before converting the whole book.</span>
       </label>
+      <section class="toc-tools" id="tocTools" aria-label="תוכן עניינים מובנה" hidden>
+        <h2>בחירה מתוכן העניינים</h2>
+        <p>בחרו פרק או סעיף. טווחי העמודים יחושבו לפי יעדי תוכן העניינים המובנה בקובץ ויועתקו לשדה העמודים.</p>
+        <div class="toc-actions">
+          <button type="button" id="selectAllToc">בחר הכול</button>
+          <button type="button" id="clearToc">נקה בחירה</button>
+        </div>
+        <div class="toc-list" id="tocList"></div>
+        <div class="toc-status" id="tocStatus" aria-live="polite"></div>
+      </section>
+      <label class="field checkbox"><input type="checkbox" name="use_cache" checked> Reuse structured extraction cache (stored locally)</label>
       <label class="field checkbox"><input type="checkbox" name="no_images"> Skip embedded images</label>
       <label class="field">JPEG image quality
         <input type="number" name="image_quality" min="35" max="95" value="84" inputmode="numeric">
@@ -4302,15 +5946,93 @@ UPLOAD_PAGE = """<!doctype html>
         card.style.setProperty(`--crop-${edgeFromName(range.name)}`, `${value}%`);
       });
     }
+    const tocTools = document.getElementById('tocTools');
+    const tocList = document.getElementById('tocList');
+    const tocStatus = document.getElementById('tocStatus');
+    const pageRangeInput = document.getElementById('pageRangeInput');
+
+    function compactPageNumbers(numbers) {
+      const sorted = Array.from(numbers).sort((a, b) => a - b);
+      const ranges = [];
+      let start = null;
+      let previous = null;
+      for (const page of sorted) {
+        if (start === null) {
+          start = previous = page;
+        } else if (page === previous + 1) {
+          previous = page;
+        } else {
+          ranges.push(start === previous ? `${start}` : `${start}-${previous}`);
+          start = previous = page;
+        }
+      }
+      if (start !== null) ranges.push(start === previous ? `${start}` : `${start}-${previous}`);
+      return ranges.join(',');
+    }
+
+    function syncOutlineSelection() {
+      const selected = tocList.querySelectorAll('input[type=checkbox]:checked');
+      const pages = new Set();
+      selected.forEach(input => {
+        const start = Number(input.dataset.start);
+        const end = Number(input.dataset.end);
+        for (let page = start; page <= end; page += 1) pages.add(page);
+      });
+      pageRangeInput.value = compactPageNumbers(pages);
+      tocStatus.textContent = selected.length
+        ? `נבחרו ${selected.length} פריטים, ${pages.size} עמודי PDF לרינדור ולהדפסה.`
+        : 'לא נבחרו פריטים. אם שדה העמודים ריק, הספר כולו ירונדר.';
+    }
+
+    function renderOutline(outline, pageCount) {
+      tocList.replaceChildren();
+      if (!Array.isArray(outline) || !outline.length) {
+        tocTools.hidden = true;
+        return;
+      }
+      outline.forEach((item, index) => {
+        const label = document.createElement('label');
+        label.className = 'toc-item';
+        label.style.setProperty('--toc-level', Math.min(Number(item.level) || 0, 7));
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.start = item.start_page;
+        checkbox.dataset.end = item.end_page;
+        checkbox.setAttribute('aria-label', item.title);
+        checkbox.addEventListener('change', syncOutlineSelection);
+        const title = document.createElement('span');
+        title.className = 'toc-title';
+        title.textContent = item.title;
+        const range = document.createElement('span');
+        range.className = 'toc-range';
+        range.textContent = `PDF ${item.page_range}`;
+        label.append(checkbox, title, range);
+        tocList.append(label);
+      });
+      tocTools.hidden = false;
+      tocStatus.textContent = `${outline.length} פריטי תוכן עניינים נמצאו ב-${pageCount} עמודים.`;
+    }
+
+    document.getElementById('selectAllToc').addEventListener('click', () => {
+      tocList.querySelectorAll('input[type=checkbox]').forEach(input => { input.checked = true; });
+      syncOutlineSelection();
+    });
+    document.getElementById('clearToc').addEventListener('click', () => {
+      tocList.querySelectorAll('input[type=checkbox]').forEach(input => { input.checked = false; });
+      syncOutlineSelection();
+    });
+
     async function loadPreview(file) {
       const previews = document.querySelectorAll('.crop-preview');
       previews.forEach(preview => preview.classList.add('loading'));
+      tocTools.hidden = true;
       const formData = new FormData();
       formData.append('pdf', file);
       try {
         const response = await fetch('/preview', { method: 'POST', body: formData });
         if (!response.ok) throw new Error(await response.text());
         const data = await response.json();
+        renderOutline(data.outline || [], data.page_count || 0);
         for (const page of data.pages || []) {
           const card = document.querySelector(`[data-side="${page.side}"]`);
           if (!card) continue;
@@ -4435,6 +6157,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--right-crop", help="Odd/right page crop as top,right,bottom,left percentages")
     parser.add_argument("--left-crop", help="Even/left page crop as top,right,bottom,left percentages")
     parser.add_argument("--pages", help="Optional page range to convert, for example: 1-5,8,12")
+    parser.add_argument(
+        "--cache",
+        nargs="?",
+        const="auto",
+        metavar="PATH",
+        help="Reuse a structured extraction cache; omit PATH to use extraction-cache/<book>.pdfcache",
+    )
     parser.add_argument("--no-images", action="store_true", help="Do not render or embed PDF images")
     parser.add_argument("--image-quality", type=int, default=IMAGE_JPEG_QUALITY, help="Embedded JPEG quality from 35 to 95 (default: 84)")
     parser.add_argument("--image-max-width", type=int, default=IMAGE_MAX_EMBED_WIDTH, help="Maximum embedded image width in pixels from 240 to 2000 (default: 900)")
@@ -4456,12 +6185,19 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         page_numbers = parse_page_ranges(args.pages)
+        if args.cache is None:
+            cache_path = None
+        elif args.cache == "auto":
+            cache_path = extraction_cache.default_cache_path(Path(args.pdf))
+        else:
+            cache_path = Path(args.cache)
         if args.debug_layout:
             output_path = write_layout_debug_report(
                 Path(args.pdf),
                 Path(args.output_dir),
                 crop_settings=crop_settings,
                 page_numbers=page_numbers,
+                cache_path=cache_path,
             )
         else:
             output_path = create_reader(
@@ -4469,6 +6205,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.output_dir),
                 crop_settings=crop_settings,
                 page_numbers=page_numbers,
+                cache_path=cache_path,
                 embed_images=not args.no_images,
                 image_quality=args.image_quality,
                 image_max_width=args.image_max_width,

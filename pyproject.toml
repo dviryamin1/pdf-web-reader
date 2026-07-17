@@ -11,13 +11,14 @@ dependencies = [
 
 [project.scripts]
 hebrew-pdf-reader = "pdf_reader_tool:main"
+pdf-layout-cache = "pdf_cache_tool:main"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["pdf_reader_tool"]
+py-modules = ["pdf_reader_tool", "pdf_cache_tool"]
 
 [tool.setuptools.package-dir]
 "" = "src"
